@@ -1,0 +1,187 @@
+const fs = require("fs");
+const os = require("os");
+const path = require("path");
+const { spawn } = require("child_process");
+const {
+  DEFAULT_SETTINGS,
+  buildPrompt,
+  fileExists,
+  normalizeRunnerError,
+  resolveCodexLauncher,
+} = require("./shared");
+
+function spawnProcess(command, args, options) {
+  const timeoutMs = Math.max(Number(options.timeoutMs || 0), 0);
+
+  return new Promise((resolve, reject) => {
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+
+    let child;
+    try {
+      child = spawn(command, args, {
+        cwd: options.cwd,
+        env: options.env,
+        windowsHide: true,
+      });
+    } catch (error) {
+      reject(error);
+      return;
+    }
+
+    const cleanup = () => {
+      if (timer) {
+        clearTimeout(timer);
+      }
+    };
+
+    const finish = (callback) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      cleanup();
+      callback();
+    };
+
+    const timer =
+      timeoutMs > 0
+        ? setTimeout(() => {
+            finish(() => {
+              try {
+                child.kill();
+              } catch (_error) {
+                // ignore
+              }
+              reject(new Error(`Codex 运行超过 ${Math.round(timeoutMs / 1000)} 秒，已超时。`));
+            });
+          }, timeoutMs)
+        : null;
+
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk.toString("utf8");
+    });
+
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk.toString("utf8");
+    });
+
+    child.on("error", (error) => {
+      finish(() => reject(error));
+    });
+
+    child.on("close", (code, signal) => {
+      finish(() => resolve({ code, signal, stdout, stderr }));
+    });
+
+    if (options.input) {
+      child.stdin.write(options.input);
+    }
+    child.stdin.end();
+  });
+}
+
+function buildCodexExecArgs(plugin, outputPath) {
+  const args = [
+    "exec",
+    "-",
+    "--model",
+    plugin.settings.codexModel,
+    "--color",
+    "never",
+    "--skip-git-repo-check",
+    "--output-last-message",
+    outputPath,
+    "-c",
+    `model_reasoning_effort="${plugin.settings.codexReasoningEffort}"`,
+  ];
+
+  if (plugin.settings.codexSandbox) {
+    args.push("--sandbox", plugin.settings.codexSandbox);
+  }
+
+  return args;
+}
+
+async function runCliTask(plugin, payload) {
+  const launcher = resolveCodexLauncher(plugin.settings.codexCliPath);
+  const vaultPath = plugin.getVaultBasePath();
+  if (!vaultPath) {
+    throw new Error("无法解析当前库的本地路径。");
+  }
+
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "obsidian-codex-"));
+  const outputPath = path.join(tempDir, "last-message.txt");
+  const prompt = buildPrompt(payload.action, payload.instruction, payload, vaultPath);
+  const args = launcher.args.concat(buildCodexExecArgs(plugin, outputPath));
+  const startedAt = Date.now();
+
+  try {
+    const result = await spawnProcess(launcher.command, args, {
+      cwd: vaultPath,
+      env: { ...process.env },
+      input: prompt,
+      timeoutMs: Number(plugin.settings.codexTimeoutSec || DEFAULT_SETTINGS.codexTimeoutSec) * 1000,
+    });
+
+    const outputText = fileExists(outputPath)
+      ? fs.readFileSync(outputPath, "utf8").trim()
+      : "";
+
+    if (result.code !== 0) {
+      const detail = normalizeRunnerError(result.stderr || result.stdout || `Codex exited with status ${result.code}.`);
+      throw new Error(detail);
+    }
+
+    const finalText = outputText || String(result.stdout || "").trim();
+    if (!finalText) {
+      throw new Error("Codex 返回了空结果。");
+    }
+
+    return {
+      result: finalText,
+      meta: {
+        action: payload.action,
+        model: plugin.settings.codexModel,
+        elapsed_ms: Date.now() - startedAt,
+        runner: "直接 CLI",
+        launcher: launcher.displayPath,
+      },
+    };
+  } catch (error) {
+    throw new Error(normalizeRunnerError(error?.message || String(error)));
+  } finally {
+    try {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    } catch (_error) {
+      // ignore cleanup failures
+    }
+  }
+}
+
+async function checkCliRunner(plugin) {
+  const launcher = resolveCodexLauncher(plugin.settings.codexCliPath);
+  const result = await spawnProcess(launcher.command, launcher.args.concat(["--version"]), {
+    cwd: plugin.getVaultBasePath() || process.cwd(),
+    env: { ...process.env },
+    input: "",
+    timeoutMs: 15000,
+  });
+
+  if (result.code !== 0) {
+    throw new Error(normalizeRunnerError(result.stderr || result.stdout || "Codex 版本检查失败。"));
+  }
+
+  const version = String(result.stdout || result.stderr || "").trim().split(/\r?\n/)[0] || "Codex CLI";
+  return {
+    mode: "直接 CLI",
+    version,
+    launcher: launcher.displayPath,
+  };
+}
+
+module.exports = {
+  checkCliRunner,
+  runCliTask,
+};

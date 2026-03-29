@@ -1,0 +1,7 @@
+release/
+README.user.md
+*.log
+*.pyc
+__pycache__/
+Thumbs.db
+.DS_Store

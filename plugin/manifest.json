@@ -1,0 +1,9 @@
+{
+  "id": "codex-agent",
+  "name": "Codex 助手",
+  "version": "0.2.0",
+  "minAppVersion": "1.5.0",
+  "description": "在 Obsidian 中直接使用 Codex，提供更顺手的侧边栏、笔记上下文感知提示词，以及可选的桥接回退模式。",
+  "author": "LHY",
+  "isDesktopOnly": true
+}
