@@ -55,6 +55,16 @@ const REASONING_EFFORTS = {
   high: "高",
 };
 
+const IMAGE_EXTENSIONS = new Set([
+  ".png",
+  ".jpg",
+  ".jpeg",
+  ".gif",
+  ".webp",
+  ".bmp",
+  ".svg",
+]);
+
 const DEFAULT_SETTINGS = {
   runnerMode: "cli",
   codexCliPath: "",
@@ -262,9 +272,57 @@ function formatSelection(selection) {
   return String(selection || "").trim() || "(未提供选中内容)";
 }
 
+function formatBytes(size) {
+  const value = Number(size || 0);
+  if (!Number.isFinite(value) || value <= 0) {
+    return "";
+  }
+
+  if (value < 1024) {
+    return `${value} B`;
+  }
+
+  if (value < 1024 * 1024) {
+    return `${(value / 1024).toFixed(1)} KB`;
+  }
+
+  return `${(value / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function isImageAttachment(filePath, mimeType) {
+  const normalizedMime = String(mimeType || "").trim().toLowerCase();
+  if (normalizedMime.startsWith("image/")) {
+    return true;
+  }
+
+  const ext = path.extname(String(filePath || "")).trim().toLowerCase();
+  return IMAGE_EXTENSIONS.has(ext);
+}
+
+function classifyAttachment(filePath, mimeType) {
+  return isImageAttachment(filePath, mimeType) ? "image" : "file";
+}
+
+function formatAttachments(attachments) {
+  if (!Array.isArray(attachments) || attachments.length === 0) {
+    return "未提供附件。";
+  }
+
+  return attachments
+    .map((attachment, index) => {
+      const name = String(attachment?.name || attachment?.path || `附件 ${index + 1}`).trim();
+      const kind = attachment?.kind === "image" ? "图片" : "文件";
+      const size = formatBytes(attachment?.size);
+      const pathLabel = String(attachment?.path || "").trim() || "(路径不可用)";
+      return `${index + 1}. [${kind}] ${name}${size ? ` · ${size}` : ""}\n   路径: ${pathLabel}`;
+    })
+    .join("\n");
+}
+
 function buildPrompt(action, instruction, payload, vaultPath) {
   const noteBlock = formatNoteContext(payload.note);
   const selectionBlock = formatSelection(payload.selection);
+  const attachmentsBlock = formatAttachments(payload.attachments || []);
   const vaultBlock = `库根目录: ${vaultPath || "(未知)"}`;
 
   if (action === "chat") {
@@ -272,6 +330,8 @@ function buildPrompt(action, instruction, payload, vaultPath) {
       "你是运行在 Obsidian 中的 Codex。",
       "你当前由桌面版 Obsidian 插件调用。仓库根目录就是你的工作目录。",
       "在相关时使用提供的笔记上下文；如果有助于回答问题，也可以查看库中的其他文件。",
+      "如果提供了附件，请结合附件内容一起分析并回答。",
+      "图片附件会作为视觉输入直接附带；其他附件可以通过列出的本地路径读取。",
       "默认使用中文回答，除非用户明确要求其他语言。",
       "只返回 Markdown，不要把整个回答包在代码块里。",
       "",
@@ -280,6 +340,8 @@ function buildPrompt(action, instruction, payload, vaultPath) {
       `用户请求:\n${instruction}`,
       "",
       `选中内容:\n${selectionBlock}`,
+      "",
+      `附件:\n${attachmentsBlock}`,
       "",
       `当前笔记:\n${noteBlock}`,
       "",
@@ -290,6 +352,8 @@ function buildPrompt(action, instruction, payload, vaultPath) {
     return [
       "你是运行在 Obsidian 中的 Codex。",
       "请根据用户要求改写选中的文本。",
+      "如果提供了附件，请在必要时参考附件内容。",
+      "图片附件会作为视觉输入直接附带；其他附件可以通过列出的本地路径读取。",
       "默认使用中文输出，除非用户明确要求其他语言。",
       "只返回改写后的替换文本。",
       "除非用户明确要求，否则请保留 Markdown、链接和事实信息。",
@@ -300,6 +364,8 @@ function buildPrompt(action, instruction, payload, vaultPath) {
       "",
       `选中内容:\n${selectionBlock}`,
       "",
+      `附件:\n${attachmentsBlock}`,
+      "",
       `所在笔记上下文:\n${noteBlock}`,
       "",
     ].join("\n");
@@ -309,12 +375,16 @@ function buildPrompt(action, instruction, payload, vaultPath) {
     return [
       "你是运行在 Obsidian 中的 Codex。",
       "请基于提供的笔记生成一篇精炼、可独立阅读的 Markdown 摘要笔记。",
+      "如果提供了附件，请在确有帮助时结合附件内容补充摘要。",
+      "图片附件会作为视觉输入直接附带；其他附件可以通过列出的本地路径读取。",
       "默认使用中文输出，除非用户明确要求其他语言。",
       "使用一级标题，并让摘要适合后续复习回顾。",
       "",
       vaultBlock,
       "",
       `摘要要求:\n${instruction || DEFAULT_SETTINGS.defaultSummaryInstruction}`,
+      "",
+      `附件:\n${attachmentsBlock}`,
       "",
       `当前笔记:\n${noteBlock}`,
       "",
@@ -325,6 +395,8 @@ function buildPrompt(action, instruction, payload, vaultPath) {
     return [
       "你是运行在 Obsidian 中的 Codex。",
       "请根据用户请求和提供的上下文起草一篇新的 Markdown 笔记。",
+      "如果提供了附件，请把附件中的关键信息整合进结果。",
+      "图片附件会作为视觉输入直接附带；其他附件可以通过列出的本地路径读取。",
       "默认使用中文输出，除非用户明确要求其他语言。",
       "只返回笔记正文，并以一级标题开头。",
       "",
@@ -333,6 +405,8 @@ function buildPrompt(action, instruction, payload, vaultPath) {
       `新笔记需求:\n${instruction}`,
       "",
       `选中内容:\n${selectionBlock}`,
+      "",
+      `附件:\n${attachmentsBlock}`,
       "",
       `参考笔记上下文:\n${noteBlock}`,
       "",
@@ -385,9 +459,13 @@ module.exports = {
   SANDBOX_MODES,
   VIEW_TYPE_CODEX_AGENT,
   buildPrompt,
+  classifyAttachment,
   deriveTitleFromContent,
   fileExists,
+  formatAttachments,
+  formatBytes,
   formatTimestamp,
+  isImageAttachment,
   makeMessageId,
   normalizeRunnerError,
   resolveCodexLauncher,
@@ -403,6 +481,7 @@ const os = require("os");
 const path = require("path");
 const { spawn } = require("child_process");
 const {
+  classifyAttachment,
   DEFAULT_SETTINGS,
   buildPrompt,
   fileExists,
@@ -482,7 +561,82 @@ function spawnProcess(command, args, options) {
   });
 }
 
-function buildCodexExecArgs(plugin, outputPath) {
+function sanitizeAttachmentName(fileName) {
+  const value = String(fileName || "").trim() || "attachment";
+  return value.replace(/[\\/:*?"<>|]/g, "_");
+}
+
+function makeUniquePath(directory, fileName) {
+  const ext = path.extname(fileName);
+  const base = fileName.slice(0, fileName.length - ext.length) || "attachment";
+  let candidate = path.join(directory, fileName);
+  let index = 2;
+
+  while (fs.existsSync(candidate)) {
+    candidate = path.join(directory, `${base}-${index}${ext}`);
+    index += 1;
+  }
+
+  return candidate;
+}
+
+function stagePayloadAttachments(plugin, payload, vaultPath) {
+  const attachments = Array.isArray(payload.attachments) ? payload.attachments : [];
+  if (attachments.length === 0) {
+    return {
+      attachments: [],
+      imagePaths: [],
+      cleanupDir: "",
+    };
+  }
+
+  const pluginDir = plugin.getInstalledPluginDir() || vaultPath;
+  const attachmentRoot = path.join(pluginDir, ".task-attachments");
+  fs.mkdirSync(attachmentRoot, { recursive: true });
+
+  const cleanupDir = path.join(
+    attachmentRoot,
+    `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+  );
+  fs.mkdirSync(cleanupDir, { recursive: true });
+
+  const stagedAttachments = [];
+  const imagePaths = [];
+
+  for (const attachment of attachments) {
+    const originalPath = String(attachment?.path || "").trim();
+    if (!originalPath || !fileExists(originalPath)) {
+      continue;
+    }
+
+    const safeName = sanitizeAttachmentName(attachment.name || path.basename(originalPath));
+    const stagedPath = makeUniquePath(cleanupDir, safeName);
+    fs.copyFileSync(originalPath, stagedPath);
+
+    const stagedStat = fs.statSync(stagedPath);
+    const kind = attachment.kind || classifyAttachment(stagedPath, attachment.mimeType);
+    const stagedAttachment = Object.assign({}, attachment, {
+      name: attachment.name || path.basename(originalPath),
+      originalPath,
+      path: stagedPath,
+      size: Number(attachment.size || stagedStat.size || 0),
+      kind,
+    });
+
+    stagedAttachments.push(stagedAttachment);
+    if (kind === "image") {
+      imagePaths.push(stagedPath);
+    }
+  }
+
+  return {
+    attachments: stagedAttachments,
+    imagePaths,
+    cleanupDir,
+  };
+}
+
+function buildCodexExecArgs(plugin, outputPath, imagePaths) {
   const args = [
     "exec",
     "-",
@@ -496,6 +650,10 @@ function buildCodexExecArgs(plugin, outputPath) {
     "-c",
     `model_reasoning_effort="${plugin.settings.codexReasoningEffort}"`,
   ];
+
+  for (const imagePath of imagePaths || []) {
+    args.push("--image", imagePath);
+  }
 
   if (plugin.settings.codexSandbox) {
     args.push("--sandbox", plugin.settings.codexSandbox);
@@ -513,8 +671,12 @@ async function runCliTask(plugin, payload) {
 
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "obsidian-codex-"));
   const outputPath = path.join(tempDir, "last-message.txt");
-  const prompt = buildPrompt(payload.action, payload.instruction, payload, vaultPath);
-  const args = launcher.args.concat(buildCodexExecArgs(plugin, outputPath));
+  const staged = stagePayloadAttachments(plugin, payload, vaultPath);
+  const stagedPayload = Object.assign({}, payload, {
+    attachments: staged.attachments,
+  });
+  const prompt = buildPrompt(payload.action, payload.instruction, stagedPayload, vaultPath);
+  const args = launcher.args.concat(buildCodexExecArgs(plugin, outputPath, staged.imagePaths));
   const startedAt = Date.now();
 
   try {
@@ -547,11 +709,19 @@ async function runCliTask(plugin, payload) {
         elapsed_ms: Date.now() - startedAt,
         runner: "直接 CLI",
         launcher: launcher.displayPath,
+        attachment_count: staged.attachments.length,
       },
     };
   } catch (error) {
     throw new Error(normalizeRunnerError(error?.message || String(error)));
   } finally {
+    try {
+      if (staged.cleanupDir) {
+        fs.rmSync(staged.cleanupDir, { recursive: true, force: true });
+      }
+    } catch (_error) {
+      // ignore cleanup failures
+    }
     try {
       fs.rmSync(tempDir, { recursive: true, force: true });
     } catch (_error) {
@@ -598,6 +768,7 @@ const {
 const {
   ACTIONS,
   CONTEXT_MODES,
+  formatBytes,
   RUNNER_MODES,
   VIEW_TYPE_CODEX_AGENT,
   makeMessageId,
@@ -714,10 +885,12 @@ class CodexAgentView extends ItemView {
     this.plugin = plugin;
     this.renderToken = 0;
     this.transcriptEl = null;
+    this.fileInputEl = null;
     this.state = {
       action: "chat",
       contextMode: "note+selection",
       instruction: "",
+      attachments: [],
       busy: false,
       messages: [],
       runnerInfo: "",
@@ -748,6 +921,10 @@ class CodexAgentView extends ItemView {
     if (this.plugin.sidebarView === this) {
       this.plugin.sidebarView = null;
     }
+    if (this.fileInputEl) {
+      this.fileInputEl.remove();
+      this.fileInputEl = null;
+    }
   }
 
   setRunnerInfo(text) {
@@ -759,10 +936,11 @@ class CodexAgentView extends ItemView {
     this.state.messages = [];
     this.state.lastError = "";
     this.state.resultActionsExpandedId = "";
+    this.state.attachments = [];
     this.render();
   }
 
-  beginTask({ action, contextMode, instruction }) {
+  beginTask({ action, contextMode, instruction, attachments = [] }) {
     const userId = makeMessageId();
     const assistantId = makeMessageId();
 
@@ -778,7 +956,9 @@ class CodexAgentView extends ItemView {
       action,
       contextMode,
       text: instruction || ACTIONS[action].hint,
-      meta: null,
+      meta: {
+        attachments,
+      },
       pending: false,
       error: false,
     });
@@ -848,6 +1028,7 @@ class CodexAgentView extends ItemView {
         action,
         instruction,
         contextMode: this.state.contextMode,
+        attachments: this.state.attachments,
         openSidebar: true,
       });
       if (action !== "chat") {
@@ -886,6 +1067,91 @@ class CodexAgentView extends ItemView {
     return button;
   }
 
+  ensureFileInput() {
+    if (this.fileInputEl?.isConnected) {
+      return this.fileInputEl;
+    }
+
+    const input = this.contentEl.createEl("input", {
+      cls: "codex-agent-hidden-file-input",
+    });
+    input.type = "file";
+    input.multiple = true;
+    input.addEventListener("change", () => {
+      const files = Array.from(input.files || []);
+      if (!files.length) {
+        return;
+      }
+
+      const existing = new Map(
+        this.state.attachments.map((attachment) => [attachment.path.toLowerCase(), attachment])
+      );
+      let addedCount = 0;
+
+      for (const file of files) {
+        const record = this.plugin.createAttachmentRecord(file);
+        if (!record) {
+          continue;
+        }
+        existing.set(record.path.toLowerCase(), record);
+        addedCount += 1;
+      }
+
+      if (!addedCount) {
+        new Notice("没有读取到可用附件。请确认你选择的是本地文件。");
+        return;
+      }
+
+      this.state.attachments = Array.from(existing.values());
+      this.render();
+      new Notice(`已添加 ${addedCount} 个附件。`);
+    });
+
+    this.fileInputEl = input;
+    return input;
+  }
+
+  openAttachmentPicker() {
+    const input = this.ensureFileInput();
+    input.value = "";
+    input.click();
+  }
+
+  removeAttachment(attachmentId) {
+    this.state.attachments = this.state.attachments.filter((attachment) => attachment.id !== attachmentId);
+    this.render();
+  }
+
+  renderAttachmentChips(parent, attachments, options = {}) {
+    if (!Array.isArray(attachments) || attachments.length === 0) {
+      return;
+    }
+
+    const list = parent.createDiv({ cls: "codex-agent-attachment-list" });
+    for (const attachment of attachments) {
+      const chip = list.createDiv({
+        cls: `codex-agent-attachment-chip is-${attachment.kind || "file"}`,
+      });
+
+      const icon = chip.createSpan({ cls: "codex-agent-attachment-icon" });
+      setIcon(icon, attachment.kind === "image" ? "image" : "paperclip");
+
+      const label = chip.createSpan({ cls: "codex-agent-attachment-label" });
+      const sizeText = formatBytes(attachment.size);
+      label.setText(`${attachment.name || "附件"}${sizeText ? ` · ${sizeText}` : ""}`);
+      chip.setAttr("title", attachment.path || attachment.name || "附件");
+
+      if (options.removable) {
+        const removeButton = chip.createEl("button", {
+          cls: "codex-agent-attachment-remove",
+        });
+        setIcon(removeButton, "x");
+        removeButton.ariaLabel = `移除附件 ${attachment.name || ""}`.trim();
+        removeButton.addEventListener("click", () => this.removeAttachment(attachment.id));
+      }
+    }
+  }
+
   renderContextStrip(parent) {
     const summary = this.plugin.getContextSummary();
     const strip = parent.createDiv({ cls: "codex-agent-context-strip" });
@@ -905,6 +1171,9 @@ class CodexAgentView extends ItemView {
       createBadge("当前无笔记", "muted");
     }
     createBadge(summary.selectionText, summary.selectionLength > 0 ? "selection" : "muted");
+    if (this.state.attachments.length > 0) {
+      createBadge(`附件 ${this.state.attachments.length}`, "attachment");
+    }
   }
 
   async renderMessages(container, token) {
@@ -948,6 +1217,12 @@ class CodexAgentView extends ItemView {
         text: CONTEXT_MODES[message.contextMode] || message.contextMode,
         cls: "codex-agent-tag is-muted",
       });
+      if (message.meta?.attachments?.length) {
+        left.createEl("span", {
+          text: `附件 ${message.meta.attachments.length}`,
+          cls: "codex-agent-tag",
+        });
+      }
 
       const right = header.createDiv({ cls: "codex-agent-message-right" });
       if (message.pending) {
@@ -976,6 +1251,10 @@ class CodexAgentView extends ItemView {
           text: message.text,
           cls: "codex-agent-plain-text",
         });
+      }
+
+      if (message.meta?.attachments?.length) {
+        this.renderAttachmentChips(card, message.meta.attachments, { removable: false });
       }
 
       if (latestAssistant && latestAssistant.id === message.id && !message.pending && !message.error) {
@@ -1150,7 +1429,29 @@ class CodexAgentView extends ItemView {
       }
     });
 
+    if (this.state.attachments.length > 0) {
+      this.renderAttachmentChips(composer, this.state.attachments, { removable: true });
+    }
+
     const composerFooter = composer.createDiv({ cls: "codex-agent-composer-footer" });
+    const composerActions = composerFooter.createDiv({ cls: "codex-agent-composer-footer-actions" });
+    const attachmentButton = composerActions.createEl("button", {
+      text: this.state.attachments.length > 0 ? "继续添加附件" : "上传附件",
+    });
+    attachmentButton.disabled = this.state.busy;
+    attachmentButton.addEventListener("click", () => this.openAttachmentPicker());
+
+    if (this.state.attachments.length > 0) {
+      const clearButton = composerActions.createEl("button", {
+        text: "清空附件",
+      });
+      clearButton.disabled = this.state.busy;
+      clearButton.addEventListener("click", () => {
+        this.state.attachments = [];
+        this.render();
+      });
+    }
+
     const runButton = composerFooter.createEl("button", {
       text: this.state.busy ? "执行中..." : actionConfig.label,
       cls: "mod-cta",
@@ -1212,6 +1513,7 @@ const {
 } = require("obsidian");
 const {
   ACTIONS,
+  classifyAttachment,
   DEFAULT_SETTINGS,
   PLUGIN_VERSION,
   REASONING_EFFORTS,
@@ -1219,6 +1521,7 @@ const {
   SANDBOX_MODES,
   VIEW_TYPE_CODEX_AGENT,
   deriveTitleFromContent,
+  fileExists,
   formatTimestamp,
   safeJsonParse,
   sanitizeFileName,
@@ -1740,6 +2043,53 @@ module.exports = class CodexAgentPlugin extends Plugin {
     return `data:${mimeType};base64,${content.toString("base64")}`;
   }
 
+  createAttachmentRecord(fileLike) {
+    const attachmentPath = String(
+      fileLike?.path || fileLike?.originalPath || fileLike?.filePath || ""
+    ).trim();
+    if (!attachmentPath || !fileExists(attachmentPath)) {
+      return null;
+    }
+
+    const stat = fs.statSync(attachmentPath);
+    if (!stat.isFile()) {
+      return null;
+    }
+
+    return {
+      id:
+        String(fileLike?.id || "").trim() ||
+        `att-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      name: String(fileLike?.name || path.basename(attachmentPath)).trim() || path.basename(attachmentPath),
+      path: attachmentPath,
+      size: Number(fileLike?.size || stat.size || 0),
+      mimeType: String(fileLike?.type || fileLike?.mimeType || "").trim(),
+      kind: classifyAttachment(attachmentPath, fileLike?.type || fileLike?.mimeType),
+    };
+  }
+
+  normalizeAttachments(attachments) {
+    const normalized = [];
+    const seen = new Set();
+
+    for (const attachment of attachments || []) {
+      const record = this.createAttachmentRecord(attachment);
+      if (!record) {
+        continue;
+      }
+
+      const key = record.path.toLowerCase();
+      if (seen.has(key)) {
+        continue;
+      }
+
+      seen.add(key);
+      normalized.push(record);
+    }
+
+    return normalized;
+  }
+
   getContextSummary() {
     const view = this.getMarkdownView();
     const selection = view?.editor?.getSelection?.() || "";
@@ -1782,13 +2132,17 @@ module.exports = class CodexAgentPlugin extends Plugin {
     };
   }
 
-  async buildPayload(action, instruction, contextMode) {
+  async buildPayload(action, instruction, contextMode, attachments = []) {
+    const normalizedAttachments = this.normalizeAttachments(attachments);
+
     if (contextMode === "none") {
       return {
         action,
         instruction,
         selection: "",
         note: null,
+        attachments: normalizedAttachments,
+        resolvedContextMode: "none",
         client: {
           name: "obsidian-codex-agent",
           version: PLUGIN_VERSION,
@@ -1796,7 +2150,30 @@ module.exports = class CodexAgentPlugin extends Plugin {
       };
     }
 
-    const context = await this.requireMarkdownContext();
+    let context = null;
+    try {
+      context = await this.requireMarkdownContext();
+    } catch (error) {
+      if (!(normalizedAttachments.length > 0 && (action === "chat" || action === "create_note"))) {
+        throw error;
+      }
+    }
+
+    if (!context) {
+      return {
+        action,
+        instruction,
+        selection: "",
+        note: null,
+        attachments: normalizedAttachments,
+        resolvedContextMode: "none",
+        client: {
+          name: "obsidian-codex-agent",
+          version: PLUGIN_VERSION,
+        },
+      };
+    }
+
     if (contextMode === "selection" && !context.selection.trim()) {
       throw new Error("请先选中一些文本。");
     }
@@ -1804,6 +2181,7 @@ module.exports = class CodexAgentPlugin extends Plugin {
     return {
       action,
       instruction,
+      attachments: normalizedAttachments,
       selection:
         contextMode === "selection" || contextMode === "note+selection"
           ? context.selection
@@ -1814,6 +2192,7 @@ module.exports = class CodexAgentPlugin extends Plugin {
         contextMode === "note+selection"
           ? context.note
           : null,
+      resolvedContextMode: contextMode,
       client: {
         name: "obsidian-codex-agent",
         version: PLUGIN_VERSION,
@@ -1879,13 +2258,16 @@ module.exports = class CodexAgentPlugin extends Plugin {
 
   async callRunner(payload) {
     if (this.settings.runnerMode === "bridge") {
+      if (Array.isArray(payload.attachments) && payload.attachments.length > 0) {
+        throw new Error("当前桥接模式暂不支持附件，请切换到“直接 CLI”模式后再试。");
+      }
       return this.runBridgeTask(payload);
     }
     return runCliTask(this, payload);
   }
 
-  async executeTask({ action, instruction, contextMode, openSidebar }) {
-    const payload = await this.buildPayload(action, instruction, contextMode);
+  async executeTask({ action, instruction, contextMode, openSidebar, attachments = [] }) {
+    const payload = await this.buildPayload(action, instruction, contextMode, attachments);
     const shouldUseSidebar = openSidebar ?? this.settings.openSidebarOnRun;
     let taskHandle = null;
 
@@ -1894,8 +2276,9 @@ module.exports = class CodexAgentPlugin extends Plugin {
       if (this.sidebarView) {
         taskHandle = this.sidebarView.beginTask({
           action,
-          contextMode,
+          contextMode: payload.resolvedContextMode || contextMode,
           instruction,
+          attachments: payload.attachments || [],
         });
       }
     }
@@ -1908,7 +2291,7 @@ module.exports = class CodexAgentPlugin extends Plugin {
       return {
         action,
         instruction,
-        contextMode,
+        contextMode: payload.resolvedContextMode || contextMode,
         result: response.result,
         meta: response.meta,
       };

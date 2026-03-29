@@ -3,6 +3,7 @@ const os = require("os");
 const path = require("path");
 const { spawn } = require("child_process");
 const {
+  classifyAttachment,
   DEFAULT_SETTINGS,
   buildPrompt,
   fileExists,
@@ -82,7 +83,82 @@ function spawnProcess(command, args, options) {
   });
 }
 
-function buildCodexExecArgs(plugin, outputPath) {
+function sanitizeAttachmentName(fileName) {
+  const value = String(fileName || "").trim() || "attachment";
+  return value.replace(/[\\/:*?"<>|]/g, "_");
+}
+
+function makeUniquePath(directory, fileName) {
+  const ext = path.extname(fileName);
+  const base = fileName.slice(0, fileName.length - ext.length) || "attachment";
+  let candidate = path.join(directory, fileName);
+  let index = 2;
+
+  while (fs.existsSync(candidate)) {
+    candidate = path.join(directory, `${base}-${index}${ext}`);
+    index += 1;
+  }
+
+  return candidate;
+}
+
+function stagePayloadAttachments(plugin, payload, vaultPath) {
+  const attachments = Array.isArray(payload.attachments) ? payload.attachments : [];
+  if (attachments.length === 0) {
+    return {
+      attachments: [],
+      imagePaths: [],
+      cleanupDir: "",
+    };
+  }
+
+  const pluginDir = plugin.getInstalledPluginDir() || vaultPath;
+  const attachmentRoot = path.join(pluginDir, ".task-attachments");
+  fs.mkdirSync(attachmentRoot, { recursive: true });
+
+  const cleanupDir = path.join(
+    attachmentRoot,
+    `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+  );
+  fs.mkdirSync(cleanupDir, { recursive: true });
+
+  const stagedAttachments = [];
+  const imagePaths = [];
+
+  for (const attachment of attachments) {
+    const originalPath = String(attachment?.path || "").trim();
+    if (!originalPath || !fileExists(originalPath)) {
+      continue;
+    }
+
+    const safeName = sanitizeAttachmentName(attachment.name || path.basename(originalPath));
+    const stagedPath = makeUniquePath(cleanupDir, safeName);
+    fs.copyFileSync(originalPath, stagedPath);
+
+    const stagedStat = fs.statSync(stagedPath);
+    const kind = attachment.kind || classifyAttachment(stagedPath, attachment.mimeType);
+    const stagedAttachment = Object.assign({}, attachment, {
+      name: attachment.name || path.basename(originalPath),
+      originalPath,
+      path: stagedPath,
+      size: Number(attachment.size || stagedStat.size || 0),
+      kind,
+    });
+
+    stagedAttachments.push(stagedAttachment);
+    if (kind === "image") {
+      imagePaths.push(stagedPath);
+    }
+  }
+
+  return {
+    attachments: stagedAttachments,
+    imagePaths,
+    cleanupDir,
+  };
+}
+
+function buildCodexExecArgs(plugin, outputPath, imagePaths) {
   const args = [
     "exec",
     "-",
@@ -96,6 +172,10 @@ function buildCodexExecArgs(plugin, outputPath) {
     "-c",
     `model_reasoning_effort="${plugin.settings.codexReasoningEffort}"`,
   ];
+
+  for (const imagePath of imagePaths || []) {
+    args.push("--image", imagePath);
+  }
 
   if (plugin.settings.codexSandbox) {
     args.push("--sandbox", plugin.settings.codexSandbox);
@@ -113,8 +193,12 @@ async function runCliTask(plugin, payload) {
 
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "obsidian-codex-"));
   const outputPath = path.join(tempDir, "last-message.txt");
-  const prompt = buildPrompt(payload.action, payload.instruction, payload, vaultPath);
-  const args = launcher.args.concat(buildCodexExecArgs(plugin, outputPath));
+  const staged = stagePayloadAttachments(plugin, payload, vaultPath);
+  const stagedPayload = Object.assign({}, payload, {
+    attachments: staged.attachments,
+  });
+  const prompt = buildPrompt(payload.action, payload.instruction, stagedPayload, vaultPath);
+  const args = launcher.args.concat(buildCodexExecArgs(plugin, outputPath, staged.imagePaths));
   const startedAt = Date.now();
 
   try {
@@ -147,11 +231,19 @@ async function runCliTask(plugin, payload) {
         elapsed_ms: Date.now() - startedAt,
         runner: "直接 CLI",
         launcher: launcher.displayPath,
+        attachment_count: staged.attachments.length,
       },
     };
   } catch (error) {
     throw new Error(normalizeRunnerError(error?.message || String(error)));
   } finally {
+    try {
+      if (staged.cleanupDir) {
+        fs.rmSync(staged.cleanupDir, { recursive: true, force: true });
+      }
+    } catch (_error) {
+      // ignore cleanup failures
+    }
     try {
       fs.rmSync(tempDir, { recursive: true, force: true });
     } catch (_error) {

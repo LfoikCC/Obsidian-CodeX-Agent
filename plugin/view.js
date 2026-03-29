@@ -8,6 +8,7 @@ const {
 const {
   ACTIONS,
   CONTEXT_MODES,
+  formatBytes,
   RUNNER_MODES,
   VIEW_TYPE_CODEX_AGENT,
   makeMessageId,
@@ -124,10 +125,12 @@ class CodexAgentView extends ItemView {
     this.plugin = plugin;
     this.renderToken = 0;
     this.transcriptEl = null;
+    this.fileInputEl = null;
     this.state = {
       action: "chat",
       contextMode: "note+selection",
       instruction: "",
+      attachments: [],
       busy: false,
       messages: [],
       runnerInfo: "",
@@ -158,6 +161,10 @@ class CodexAgentView extends ItemView {
     if (this.plugin.sidebarView === this) {
       this.plugin.sidebarView = null;
     }
+    if (this.fileInputEl) {
+      this.fileInputEl.remove();
+      this.fileInputEl = null;
+    }
   }
 
   setRunnerInfo(text) {
@@ -169,10 +176,11 @@ class CodexAgentView extends ItemView {
     this.state.messages = [];
     this.state.lastError = "";
     this.state.resultActionsExpandedId = "";
+    this.state.attachments = [];
     this.render();
   }
 
-  beginTask({ action, contextMode, instruction }) {
+  beginTask({ action, contextMode, instruction, attachments = [] }) {
     const userId = makeMessageId();
     const assistantId = makeMessageId();
 
@@ -188,7 +196,9 @@ class CodexAgentView extends ItemView {
       action,
       contextMode,
       text: instruction || ACTIONS[action].hint,
-      meta: null,
+      meta: {
+        attachments,
+      },
       pending: false,
       error: false,
     });
@@ -258,6 +268,7 @@ class CodexAgentView extends ItemView {
         action,
         instruction,
         contextMode: this.state.contextMode,
+        attachments: this.state.attachments,
         openSidebar: true,
       });
       if (action !== "chat") {
@@ -296,6 +307,91 @@ class CodexAgentView extends ItemView {
     return button;
   }
 
+  ensureFileInput() {
+    if (this.fileInputEl?.isConnected) {
+      return this.fileInputEl;
+    }
+
+    const input = this.contentEl.createEl("input", {
+      cls: "codex-agent-hidden-file-input",
+    });
+    input.type = "file";
+    input.multiple = true;
+    input.addEventListener("change", () => {
+      const files = Array.from(input.files || []);
+      if (!files.length) {
+        return;
+      }
+
+      const existing = new Map(
+        this.state.attachments.map((attachment) => [attachment.path.toLowerCase(), attachment])
+      );
+      let addedCount = 0;
+
+      for (const file of files) {
+        const record = this.plugin.createAttachmentRecord(file);
+        if (!record) {
+          continue;
+        }
+        existing.set(record.path.toLowerCase(), record);
+        addedCount += 1;
+      }
+
+      if (!addedCount) {
+        new Notice("没有读取到可用附件。请确认你选择的是本地文件。");
+        return;
+      }
+
+      this.state.attachments = Array.from(existing.values());
+      this.render();
+      new Notice(`已添加 ${addedCount} 个附件。`);
+    });
+
+    this.fileInputEl = input;
+    return input;
+  }
+
+  openAttachmentPicker() {
+    const input = this.ensureFileInput();
+    input.value = "";
+    input.click();
+  }
+
+  removeAttachment(attachmentId) {
+    this.state.attachments = this.state.attachments.filter((attachment) => attachment.id !== attachmentId);
+    this.render();
+  }
+
+  renderAttachmentChips(parent, attachments, options = {}) {
+    if (!Array.isArray(attachments) || attachments.length === 0) {
+      return;
+    }
+
+    const list = parent.createDiv({ cls: "codex-agent-attachment-list" });
+    for (const attachment of attachments) {
+      const chip = list.createDiv({
+        cls: `codex-agent-attachment-chip is-${attachment.kind || "file"}`,
+      });
+
+      const icon = chip.createSpan({ cls: "codex-agent-attachment-icon" });
+      setIcon(icon, attachment.kind === "image" ? "image" : "paperclip");
+
+      const label = chip.createSpan({ cls: "codex-agent-attachment-label" });
+      const sizeText = formatBytes(attachment.size);
+      label.setText(`${attachment.name || "附件"}${sizeText ? ` · ${sizeText}` : ""}`);
+      chip.setAttr("title", attachment.path || attachment.name || "附件");
+
+      if (options.removable) {
+        const removeButton = chip.createEl("button", {
+          cls: "codex-agent-attachment-remove",
+        });
+        setIcon(removeButton, "x");
+        removeButton.ariaLabel = `移除附件 ${attachment.name || ""}`.trim();
+        removeButton.addEventListener("click", () => this.removeAttachment(attachment.id));
+      }
+    }
+  }
+
   renderContextStrip(parent) {
     const summary = this.plugin.getContextSummary();
     const strip = parent.createDiv({ cls: "codex-agent-context-strip" });
@@ -315,6 +411,9 @@ class CodexAgentView extends ItemView {
       createBadge("当前无笔记", "muted");
     }
     createBadge(summary.selectionText, summary.selectionLength > 0 ? "selection" : "muted");
+    if (this.state.attachments.length > 0) {
+      createBadge(`附件 ${this.state.attachments.length}`, "attachment");
+    }
   }
 
   async renderMessages(container, token) {
@@ -358,6 +457,12 @@ class CodexAgentView extends ItemView {
         text: CONTEXT_MODES[message.contextMode] || message.contextMode,
         cls: "codex-agent-tag is-muted",
       });
+      if (message.meta?.attachments?.length) {
+        left.createEl("span", {
+          text: `附件 ${message.meta.attachments.length}`,
+          cls: "codex-agent-tag",
+        });
+      }
 
       const right = header.createDiv({ cls: "codex-agent-message-right" });
       if (message.pending) {
@@ -386,6 +491,10 @@ class CodexAgentView extends ItemView {
           text: message.text,
           cls: "codex-agent-plain-text",
         });
+      }
+
+      if (message.meta?.attachments?.length) {
+        this.renderAttachmentChips(card, message.meta.attachments, { removable: false });
       }
 
       if (latestAssistant && latestAssistant.id === message.id && !message.pending && !message.error) {
@@ -560,7 +669,29 @@ class CodexAgentView extends ItemView {
       }
     });
 
+    if (this.state.attachments.length > 0) {
+      this.renderAttachmentChips(composer, this.state.attachments, { removable: true });
+    }
+
     const composerFooter = composer.createDiv({ cls: "codex-agent-composer-footer" });
+    const composerActions = composerFooter.createDiv({ cls: "codex-agent-composer-footer-actions" });
+    const attachmentButton = composerActions.createEl("button", {
+      text: this.state.attachments.length > 0 ? "继续添加附件" : "上传附件",
+    });
+    attachmentButton.disabled = this.state.busy;
+    attachmentButton.addEventListener("click", () => this.openAttachmentPicker());
+
+    if (this.state.attachments.length > 0) {
+      const clearButton = composerActions.createEl("button", {
+        text: "清空附件",
+      });
+      clearButton.disabled = this.state.busy;
+      clearButton.addEventListener("click", () => {
+        this.state.attachments = [];
+        this.render();
+      });
+    }
+
     const runButton = composerFooter.createEl("button", {
       text: this.state.busy ? "执行中..." : actionConfig.label,
       cls: "mod-cta",

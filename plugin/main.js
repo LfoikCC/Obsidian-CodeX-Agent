@@ -12,6 +12,7 @@ const {
 } = require("obsidian");
 const {
   ACTIONS,
+  classifyAttachment,
   DEFAULT_SETTINGS,
   PLUGIN_VERSION,
   REASONING_EFFORTS,
@@ -19,6 +20,7 @@ const {
   SANDBOX_MODES,
   VIEW_TYPE_CODEX_AGENT,
   deriveTitleFromContent,
+  fileExists,
   formatTimestamp,
   safeJsonParse,
   sanitizeFileName,
@@ -540,6 +542,53 @@ module.exports = class CodexAgentPlugin extends Plugin {
     return `data:${mimeType};base64,${content.toString("base64")}`;
   }
 
+  createAttachmentRecord(fileLike) {
+    const attachmentPath = String(
+      fileLike?.path || fileLike?.originalPath || fileLike?.filePath || ""
+    ).trim();
+    if (!attachmentPath || !fileExists(attachmentPath)) {
+      return null;
+    }
+
+    const stat = fs.statSync(attachmentPath);
+    if (!stat.isFile()) {
+      return null;
+    }
+
+    return {
+      id:
+        String(fileLike?.id || "").trim() ||
+        `att-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      name: String(fileLike?.name || path.basename(attachmentPath)).trim() || path.basename(attachmentPath),
+      path: attachmentPath,
+      size: Number(fileLike?.size || stat.size || 0),
+      mimeType: String(fileLike?.type || fileLike?.mimeType || "").trim(),
+      kind: classifyAttachment(attachmentPath, fileLike?.type || fileLike?.mimeType),
+    };
+  }
+
+  normalizeAttachments(attachments) {
+    const normalized = [];
+    const seen = new Set();
+
+    for (const attachment of attachments || []) {
+      const record = this.createAttachmentRecord(attachment);
+      if (!record) {
+        continue;
+      }
+
+      const key = record.path.toLowerCase();
+      if (seen.has(key)) {
+        continue;
+      }
+
+      seen.add(key);
+      normalized.push(record);
+    }
+
+    return normalized;
+  }
+
   getContextSummary() {
     const view = this.getMarkdownView();
     const selection = view?.editor?.getSelection?.() || "";
@@ -582,13 +631,17 @@ module.exports = class CodexAgentPlugin extends Plugin {
     };
   }
 
-  async buildPayload(action, instruction, contextMode) {
+  async buildPayload(action, instruction, contextMode, attachments = []) {
+    const normalizedAttachments = this.normalizeAttachments(attachments);
+
     if (contextMode === "none") {
       return {
         action,
         instruction,
         selection: "",
         note: null,
+        attachments: normalizedAttachments,
+        resolvedContextMode: "none",
         client: {
           name: "obsidian-codex-agent",
           version: PLUGIN_VERSION,
@@ -596,7 +649,30 @@ module.exports = class CodexAgentPlugin extends Plugin {
       };
     }
 
-    const context = await this.requireMarkdownContext();
+    let context = null;
+    try {
+      context = await this.requireMarkdownContext();
+    } catch (error) {
+      if (!(normalizedAttachments.length > 0 && (action === "chat" || action === "create_note"))) {
+        throw error;
+      }
+    }
+
+    if (!context) {
+      return {
+        action,
+        instruction,
+        selection: "",
+        note: null,
+        attachments: normalizedAttachments,
+        resolvedContextMode: "none",
+        client: {
+          name: "obsidian-codex-agent",
+          version: PLUGIN_VERSION,
+        },
+      };
+    }
+
     if (contextMode === "selection" && !context.selection.trim()) {
       throw new Error("请先选中一些文本。");
     }
@@ -604,6 +680,7 @@ module.exports = class CodexAgentPlugin extends Plugin {
     return {
       action,
       instruction,
+      attachments: normalizedAttachments,
       selection:
         contextMode === "selection" || contextMode === "note+selection"
           ? context.selection
@@ -614,6 +691,7 @@ module.exports = class CodexAgentPlugin extends Plugin {
         contextMode === "note+selection"
           ? context.note
           : null,
+      resolvedContextMode: contextMode,
       client: {
         name: "obsidian-codex-agent",
         version: PLUGIN_VERSION,
@@ -679,13 +757,16 @@ module.exports = class CodexAgentPlugin extends Plugin {
 
   async callRunner(payload) {
     if (this.settings.runnerMode === "bridge") {
+      if (Array.isArray(payload.attachments) && payload.attachments.length > 0) {
+        throw new Error("当前桥接模式暂不支持附件，请切换到“直接 CLI”模式后再试。");
+      }
       return this.runBridgeTask(payload);
     }
     return runCliTask(this, payload);
   }
 
-  async executeTask({ action, instruction, contextMode, openSidebar }) {
-    const payload = await this.buildPayload(action, instruction, contextMode);
+  async executeTask({ action, instruction, contextMode, openSidebar, attachments = [] }) {
+    const payload = await this.buildPayload(action, instruction, contextMode, attachments);
     const shouldUseSidebar = openSidebar ?? this.settings.openSidebarOnRun;
     let taskHandle = null;
 
@@ -694,8 +775,9 @@ module.exports = class CodexAgentPlugin extends Plugin {
       if (this.sidebarView) {
         taskHandle = this.sidebarView.beginTask({
           action,
-          contextMode,
+          contextMode: payload.resolvedContextMode || contextMode,
           instruction,
+          attachments: payload.attachments || [],
         });
       }
     }
@@ -708,7 +790,7 @@ module.exports = class CodexAgentPlugin extends Plugin {
       return {
         action,
         instruction,
-        contextMode,
+        contextMode: payload.resolvedContextMode || contextMode,
         result: response.result,
         meta: response.meta,
       };

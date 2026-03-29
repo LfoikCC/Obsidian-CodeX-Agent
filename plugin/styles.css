@@ -4,6 +4,10 @@
   overflow: hidden;
 }
 
+.codex-agent-hidden-file-input {
+  display: none;
+}
+
 .codex-agent-shell {
   --codex-agent-accent: #d97757;
   --codex-agent-accent-rgb: 217, 119, 87;
@@ -366,6 +370,63 @@
   margin-top: 4px;
 }
 
+.codex-agent-attachment-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.codex-agent-attachment-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  max-width: 100%;
+  padding: 7px 10px;
+  border-radius: 12px;
+  border: 1px solid var(--codex-agent-soft-border);
+  background: color-mix(in srgb, var(--background-primary) 88%, transparent);
+  color: var(--text-normal);
+}
+
+.codex-agent-attachment-chip.is-image {
+  border-color: color-mix(in srgb, var(--codex-agent-accent) 40%, var(--codex-agent-soft-border));
+}
+
+.codex-agent-attachment-icon,
+.codex-agent-attachment-remove {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.codex-agent-attachment-icon svg,
+.codex-agent-attachment-remove svg {
+  width: 14px;
+  height: 14px;
+}
+
+.codex-agent-attachment-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.codex-agent-attachment-remove {
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border-radius: 999px;
+  border: 0;
+  background: transparent;
+  color: var(--text-muted);
+}
+
+.codex-agent-attachment-remove:hover {
+  background: var(--background-modifier-hover);
+  color: var(--text-normal);
+}
+
 .codex-agent-input,
 .codex-agent-modal-input {
   width: 100%;
@@ -391,9 +452,15 @@
 .codex-agent-modal-actions {
   display: flex;
   align-items: center;
-  justify-content: flex-end;
+  justify-content: space-between;
   gap: 10px;
   margin-top: 12px;
+}
+
+.codex-agent-composer-footer-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
 }
 
 .codex-agent-advanced-panel {

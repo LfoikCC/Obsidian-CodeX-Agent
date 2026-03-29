@@ -51,6 +51,16 @@ const REASONING_EFFORTS = {
   high: "高",
 };
 
+const IMAGE_EXTENSIONS = new Set([
+  ".png",
+  ".jpg",
+  ".jpeg",
+  ".gif",
+  ".webp",
+  ".bmp",
+  ".svg",
+]);
+
 const DEFAULT_SETTINGS = {
   runnerMode: "cli",
   codexCliPath: "",
@@ -258,9 +268,57 @@ function formatSelection(selection) {
   return String(selection || "").trim() || "(未提供选中内容)";
 }
 
+function formatBytes(size) {
+  const value = Number(size || 0);
+  if (!Number.isFinite(value) || value <= 0) {
+    return "";
+  }
+
+  if (value < 1024) {
+    return `${value} B`;
+  }
+
+  if (value < 1024 * 1024) {
+    return `${(value / 1024).toFixed(1)} KB`;
+  }
+
+  return `${(value / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function isImageAttachment(filePath, mimeType) {
+  const normalizedMime = String(mimeType || "").trim().toLowerCase();
+  if (normalizedMime.startsWith("image/")) {
+    return true;
+  }
+
+  const ext = path.extname(String(filePath || "")).trim().toLowerCase();
+  return IMAGE_EXTENSIONS.has(ext);
+}
+
+function classifyAttachment(filePath, mimeType) {
+  return isImageAttachment(filePath, mimeType) ? "image" : "file";
+}
+
+function formatAttachments(attachments) {
+  if (!Array.isArray(attachments) || attachments.length === 0) {
+    return "未提供附件。";
+  }
+
+  return attachments
+    .map((attachment, index) => {
+      const name = String(attachment?.name || attachment?.path || `附件 ${index + 1}`).trim();
+      const kind = attachment?.kind === "image" ? "图片" : "文件";
+      const size = formatBytes(attachment?.size);
+      const pathLabel = String(attachment?.path || "").trim() || "(路径不可用)";
+      return `${index + 1}. [${kind}] ${name}${size ? ` · ${size}` : ""}\n   路径: ${pathLabel}`;
+    })
+    .join("\n");
+}
+
 function buildPrompt(action, instruction, payload, vaultPath) {
   const noteBlock = formatNoteContext(payload.note);
   const selectionBlock = formatSelection(payload.selection);
+  const attachmentsBlock = formatAttachments(payload.attachments || []);
   const vaultBlock = `库根目录: ${vaultPath || "(未知)"}`;
 
   if (action === "chat") {
@@ -268,6 +326,8 @@ function buildPrompt(action, instruction, payload, vaultPath) {
       "你是运行在 Obsidian 中的 Codex。",
       "你当前由桌面版 Obsidian 插件调用。仓库根目录就是你的工作目录。",
       "在相关时使用提供的笔记上下文；如果有助于回答问题，也可以查看库中的其他文件。",
+      "如果提供了附件，请结合附件内容一起分析并回答。",
+      "图片附件会作为视觉输入直接附带；其他附件可以通过列出的本地路径读取。",
       "默认使用中文回答，除非用户明确要求其他语言。",
       "只返回 Markdown，不要把整个回答包在代码块里。",
       "",
@@ -276,6 +336,8 @@ function buildPrompt(action, instruction, payload, vaultPath) {
       `用户请求:\n${instruction}`,
       "",
       `选中内容:\n${selectionBlock}`,
+      "",
+      `附件:\n${attachmentsBlock}`,
       "",
       `当前笔记:\n${noteBlock}`,
       "",
@@ -286,6 +348,8 @@ function buildPrompt(action, instruction, payload, vaultPath) {
     return [
       "你是运行在 Obsidian 中的 Codex。",
       "请根据用户要求改写选中的文本。",
+      "如果提供了附件，请在必要时参考附件内容。",
+      "图片附件会作为视觉输入直接附带；其他附件可以通过列出的本地路径读取。",
       "默认使用中文输出，除非用户明确要求其他语言。",
       "只返回改写后的替换文本。",
       "除非用户明确要求，否则请保留 Markdown、链接和事实信息。",
@@ -296,6 +360,8 @@ function buildPrompt(action, instruction, payload, vaultPath) {
       "",
       `选中内容:\n${selectionBlock}`,
       "",
+      `附件:\n${attachmentsBlock}`,
+      "",
       `所在笔记上下文:\n${noteBlock}`,
       "",
     ].join("\n");
@@ -305,12 +371,16 @@ function buildPrompt(action, instruction, payload, vaultPath) {
     return [
       "你是运行在 Obsidian 中的 Codex。",
       "请基于提供的笔记生成一篇精炼、可独立阅读的 Markdown 摘要笔记。",
+      "如果提供了附件，请在确有帮助时结合附件内容补充摘要。",
+      "图片附件会作为视觉输入直接附带；其他附件可以通过列出的本地路径读取。",
       "默认使用中文输出，除非用户明确要求其他语言。",
       "使用一级标题，并让摘要适合后续复习回顾。",
       "",
       vaultBlock,
       "",
       `摘要要求:\n${instruction || DEFAULT_SETTINGS.defaultSummaryInstruction}`,
+      "",
+      `附件:\n${attachmentsBlock}`,
       "",
       `当前笔记:\n${noteBlock}`,
       "",
@@ -321,6 +391,8 @@ function buildPrompt(action, instruction, payload, vaultPath) {
     return [
       "你是运行在 Obsidian 中的 Codex。",
       "请根据用户请求和提供的上下文起草一篇新的 Markdown 笔记。",
+      "如果提供了附件，请把附件中的关键信息整合进结果。",
+      "图片附件会作为视觉输入直接附带；其他附件可以通过列出的本地路径读取。",
       "默认使用中文输出，除非用户明确要求其他语言。",
       "只返回笔记正文，并以一级标题开头。",
       "",
@@ -329,6 +401,8 @@ function buildPrompt(action, instruction, payload, vaultPath) {
       `新笔记需求:\n${instruction}`,
       "",
       `选中内容:\n${selectionBlock}`,
+      "",
+      `附件:\n${attachmentsBlock}`,
       "",
       `参考笔记上下文:\n${noteBlock}`,
       "",
@@ -381,9 +455,13 @@ module.exports = {
   SANDBOX_MODES,
   VIEW_TYPE_CODEX_AGENT,
   buildPrompt,
+  classifyAttachment,
   deriveTitleFromContent,
   fileExists,
+  formatAttachments,
+  formatBytes,
   formatTimestamp,
+  isImageAttachment,
   makeMessageId,
   normalizeRunnerError,
   resolveCodexLauncher,
