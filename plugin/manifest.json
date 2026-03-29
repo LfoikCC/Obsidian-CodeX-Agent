@@ -5,5 +5,6 @@
   "minAppVersion": "1.5.0",
   "description": "在 Obsidian 中直接使用 Codex，提供更顺手的侧边栏、笔记上下文感知提示词，以及可选的桥接回退模式。",
   "author": "LHY",
+  "authorUrl": "https://github.com/LfoikCC/Obsidian-CodeX-Agent",
   "isDesktopOnly": true
 }
