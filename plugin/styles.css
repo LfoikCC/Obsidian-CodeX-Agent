@@ -53,8 +53,8 @@
 .codex-agent-logo svg,
 .codex-agent-icon-button svg,
 .codex-agent-spinner svg {
-  width: 16px;
-  height: 16px;
+  width: 18px;
+  height: 18px;
 }
 
 .codex-agent-title-block {
@@ -69,24 +69,32 @@
 
 .codex-agent-hero-actions {
   display: flex;
-  gap: 8px;
+  gap: 10px;
 }
 
 .codex-agent-icon-button {
-  width: 32px;
-  height: 32px;
-  border-radius: 10px;
+  width: 44px;
+  height: 44px;
+  border-radius: 12px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   color: var(--text-muted);
   background: var(--codex-agent-panel);
   border: 1px solid var(--codex-agent-soft-border);
+  box-shadow: 0 10px 24px -20px rgba(0, 0, 0, 0.45);
 }
 
 .codex-agent-icon-button:hover {
   color: var(--text-normal);
   background: var(--background-modifier-hover);
+}
+
+.codex-agent-icon-button.is-active {
+  color: white;
+  border-color: color-mix(in srgb, var(--codex-agent-accent) 46%, var(--codex-agent-soft-border));
+  background: linear-gradient(135deg, var(--codex-agent-accent), #be5f2f);
+  box-shadow: 0 14px 28px -22px var(--codex-agent-glow);
 }
 
 .codex-agent-context-strip {

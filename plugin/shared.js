@@ -2,7 +2,7 @@ const fs = require("fs");
 const path = require("path");
 
 const VIEW_TYPE_CODEX_AGENT = "codex-agent-sidebar";
-const PLUGIN_VERSION = "1.0.0";
+const PLUGIN_VERSION = "1.1.0";
 
 const ACTIONS = {
   chat: {
@@ -65,7 +65,9 @@ const DEFAULT_SETTINGS = {
   runnerMode: "cli",
   codexCliPath: "",
   codexModel: "gpt-5-codex",
+  fastResponseModel: "gpt-5.4-mini",
   codexReasoningEffort: "high",
+  fastResponseMode: true,
   codexSandbox: "read-only",
   codexTimeoutSec: 600,
   bridgeUrl: "http://127.0.0.1:8765",
@@ -328,6 +330,15 @@ function formatAttachments(attachments) {
     .join("\n");
 }
 
+function truncateText(value, maxChars) {
+  const text = String(value || "");
+  const limit = Number(maxChars || 0);
+  if (!limit || text.length <= limit) {
+    return text;
+  }
+  return `${text.slice(0, Math.max(0, limit - 24))}\n\n[已截断，原始内容更长]`;
+}
+
 function buildPrompt(action, instruction, payload, vaultPath) {
   const noteBlock = formatNoteContext(payload.note);
   const referencesBlock = formatReferencedNotes(payload.references || []);
@@ -339,6 +350,7 @@ function buildPrompt(action, instruction, payload, vaultPath) {
     return [
       "你是运行在 Obsidian 中的 Codex。",
       "你当前由桌面版 Obsidian 插件调用。仓库根目录就是你的工作目录。",
+      payload.fastMode ? "当前为极速回复模式：优先直接回答，避免不必要的展开。" : "",
       "在相关时使用提供的笔记上下文；如果有助于回答问题，也可以查看库中的其他文件。",
       "如果提供了额外引用笔记，请优先围绕这些引用笔记回答；除非用户明确要求，否则不要把当前活动笔记当成主要依据。",
       "如果提供了附件，请结合附件内容一起分析并回答。",
@@ -364,6 +376,7 @@ function buildPrompt(action, instruction, payload, vaultPath) {
   if (action === "rewrite") {
     return [
       "你是运行在 Obsidian 中的 Codex。",
+      payload.fastMode ? "当前为极速回复模式：请尽快给出可直接替换的结果。" : "",
       "请根据用户要求改写选中的文本。",
       "如果提供了额外引用笔记，请在必要时参考这些笔记。",
       "如果提供了附件，请在必要时参考附件内容。",
@@ -403,6 +416,7 @@ function buildPrompt(action, instruction, payload, vaultPath) {
 
     return [
       "你是运行在 Obsidian 中的 Codex。",
+      payload.fastMode ? "当前为极速回复模式：优先输出高信息密度的短摘要。" : "",
       summaryTask,
       "如果提供了额外引用笔记，请优先围绕这些引用笔记组织摘要。",
       "如果提供了附件，请在确有帮助时结合附件内容补充摘要。",
@@ -427,6 +441,7 @@ function buildPrompt(action, instruction, payload, vaultPath) {
   if (action === "create_note") {
     return [
       "你是运行在 Obsidian 中的 Codex。",
+      payload.fastMode ? "当前为极速回复模式：优先输出结构清晰、不过度展开的结果。" : "",
       "请根据用户请求和提供的上下文起草一篇新的 Markdown 笔记。",
       "如果提供了额外引用笔记，请优先整合这些引用笔记中的内容。",
       "如果提供了附件，请把附件中的关键信息整合进结果。",
@@ -507,5 +522,6 @@ module.exports = {
   resolveCodexLauncher,
   safeJsonParse,
   sanitizeFileName,
+  truncateText,
   trimTrailingSlash,
 };

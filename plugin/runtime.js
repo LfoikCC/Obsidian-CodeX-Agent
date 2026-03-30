@@ -158,19 +158,42 @@ function stagePayloadAttachments(plugin, payload, vaultPath) {
   };
 }
 
+function normalizeCodexModelName(modelName, fallback) {
+  const raw = String(modelName || "").trim();
+  const normalized = raw.replace(/^openai-codex\//i, "");
+  if (normalized) {
+    return normalized;
+  }
+  return String(fallback || "").trim();
+}
+
 function buildCodexExecArgs(plugin, outputPath, imagePaths) {
+  const fastModelName = normalizeCodexModelName(
+    plugin.settings.fastResponseModel,
+    DEFAULT_SETTINGS.fastResponseModel
+  );
+  const normalModelName = normalizeCodexModelName(
+    plugin.settings.codexModel,
+    DEFAULT_SETTINGS.codexModel
+  );
+  const model = plugin.settings.fastResponseMode
+    ? fastModelName
+    : normalModelName;
+  const reasoningEffort = plugin.settings.fastResponseMode
+    ? "low"
+    : plugin.settings.codexReasoningEffort;
   const args = [
     "exec",
     "-",
     "--model",
-    plugin.settings.codexModel,
+    model,
     "--color",
     "never",
     "--skip-git-repo-check",
     "--output-last-message",
     outputPath,
     "-c",
-    `model_reasoning_effort="${plugin.settings.codexReasoningEffort}"`,
+    `model_reasoning_effort="${reasoningEffort}"`,
   ];
 
   for (const imagePath of imagePaths || []) {
@@ -179,6 +202,10 @@ function buildCodexExecArgs(plugin, outputPath, imagePaths) {
 
   if (plugin.settings.codexSandbox) {
     args.push("--sandbox", plugin.settings.codexSandbox);
+  }
+
+  if (plugin.settings.fastResponseMode) {
+    args.push("--ephemeral");
   }
 
   return args;
@@ -199,6 +226,17 @@ async function runCliTask(plugin, payload) {
   });
   const prompt = buildPrompt(payload.action, payload.instruction, stagedPayload, vaultPath);
   const args = launcher.args.concat(buildCodexExecArgs(plugin, outputPath, staged.imagePaths));
+  const fastModelName = normalizeCodexModelName(
+    plugin.settings.fastResponseModel,
+    DEFAULT_SETTINGS.fastResponseModel
+  );
+  const normalModelName = normalizeCodexModelName(
+    plugin.settings.codexModel,
+    DEFAULT_SETTINGS.codexModel
+  );
+  const resolvedModel = plugin.settings.fastResponseMode
+    ? fastModelName
+    : normalModelName;
   const startedAt = Date.now();
 
   try {
@@ -227,7 +265,7 @@ async function runCliTask(plugin, payload) {
       result: finalText,
       meta: {
         action: payload.action,
-        model: plugin.settings.codexModel,
+        model: resolvedModel,
         elapsed_ms: Date.now() - startedAt,
         runner: "直接 CLI",
         launcher: launcher.displayPath,

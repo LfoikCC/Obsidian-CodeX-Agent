@@ -10,6 +10,15 @@ const {
   normalizePath,
   requestUrl,
 } = require("obsidian");
+let electronWebUtils = null;
+try {
+  const electron = require("electron");
+  if (electron?.webUtils && typeof electron.webUtils.getPathForFile === "function") {
+    electronWebUtils = electron.webUtils;
+  }
+} catch (_error) {
+  electronWebUtils = null;
+}
 const {
   ACTIONS,
   classifyAttachment,
@@ -24,10 +33,33 @@ const {
   formatTimestamp,
   safeJsonParse,
   sanitizeFileName,
+  truncateText,
   trimTrailingSlash,
 } = require("./shared");
 const { checkCliRunner, runCliTask } = require("./runtime");
 const { CodexAgentView, CodexInputModal } = require("./view");
+
+function resolveAttachmentPath(fileLike) {
+  for (const candidate of [fileLike?.path, fileLike?.originalPath, fileLike?.filePath]) {
+    const resolved = String(candidate || "").trim();
+    if (resolved) {
+      return resolved;
+    }
+  }
+
+  if (electronWebUtils?.getPathForFile && fileLike) {
+    try {
+      const resolved = String(electronWebUtils.getPathForFile(fileLike) || "").trim();
+      if (resolved) {
+        return resolved;
+      }
+    } catch (_error) {
+      // Fall through to empty path handling below.
+    }
+  }
+
+  return "";
+}
 
 class CodexAgentSettingTab extends PluginSettingTab {
   constructor(app, plugin) {
@@ -83,6 +115,20 @@ class CodexAgentSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
+      .setName("极速模型")
+      .setDesc("极速回复开启时优先使用的小模型。默认使用官方在 Codex 中可用且更快的 `gpt-5.4-mini`。")
+      .addText((text) =>
+        text
+          .setPlaceholder(DEFAULT_SETTINGS.fastResponseModel)
+          .setValue(this.plugin.settings.fastResponseModel || DEFAULT_SETTINGS.fastResponseModel)
+          .onChange(async (value) => {
+            this.plugin.settings.fastResponseModel =
+              value.trim() || DEFAULT_SETTINGS.fastResponseModel;
+            await this.plugin.saveSettings();
+          })
+      );
+
+    new Setting(containerEl)
       .setName("推理强度")
       .setDesc("插件会覆盖全局 CLI 的该项设置，避免 `xhigh` 这类不受支持的值导致执行失败。")
       .addDropdown((dropdown) =>
@@ -91,6 +137,18 @@ class CodexAgentSettingTab extends PluginSettingTab {
           .setValue(this.plugin.settings.codexReasoningEffort)
           .onChange(async (value) => {
             this.plugin.settings.codexReasoningEffort = value;
+            await this.plugin.saveSettings();
+          })
+      );
+
+    new Setting(containerEl)
+      .setName("极速回复")
+      .setDesc("默认开启。会强制使用低推理强度，并压缩笔记上下文，尽量缩短等待时间。")
+      .addToggle((toggle) =>
+        toggle
+          .setValue(Boolean(this.plugin.settings.fastResponseMode))
+          .onChange(async (value) => {
+            this.plugin.settings.fastResponseMode = Boolean(value);
             await this.plugin.saveSettings();
           })
       );
@@ -413,6 +471,17 @@ class ReferenceNotePickerModal extends Modal {
 module.exports = class CodexAgentPlugin extends Plugin {
   async onload() {
     this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+    let migrated = false;
+    if (
+      !String(this.settings.fastResponseModel || "").trim() ||
+      this.settings.fastResponseModel === "openai-codex/gpt-5.4-mini"
+    ) {
+      this.settings.fastResponseModel = DEFAULT_SETTINGS.fastResponseModel;
+      migrated = true;
+    }
+    if (migrated) {
+      await this.saveSettings();
+    }
     this.sidebarView = null;
     this.lastMarkdownLeaf = null;
 
@@ -689,9 +758,7 @@ module.exports = class CodexAgentPlugin extends Plugin {
   }
 
   createAttachmentRecord(fileLike) {
-    const attachmentPath = String(
-      fileLike?.path || fileLike?.originalPath || fileLike?.filePath || ""
-    ).trim();
+    const attachmentPath = resolveAttachmentPath(fileLike);
     if (!attachmentPath || !fileExists(attachmentPath)) {
       return null;
     }
@@ -942,6 +1009,68 @@ module.exports = class CodexAgentPlugin extends Plugin {
     );
   }
 
+  getFastContextLimits(action, hasSelection) {
+    if (action === "rewrite") {
+      return {
+        selectionChars: 3200,
+        noteChars: 1600,
+        referenceChars: 1200,
+        maxReferences: 2,
+      };
+    }
+
+    if (action === "summarize") {
+      return {
+        selectionChars: 1800,
+        noteChars: 3600,
+        referenceChars: 1600,
+        maxReferences: 2,
+      };
+    }
+
+    return {
+      selectionChars: hasSelection ? 1200 : 600,
+      noteChars: hasSelection ? 1400 : 1800,
+      referenceChars: 1200,
+      maxReferences: 2,
+    };
+  }
+
+  compactNoteContext(note, maxContentChars) {
+    if (!note) {
+      return null;
+    }
+
+    return Object.assign({}, note, {
+      content: truncateText(note.content || "", maxContentChars),
+      headings: Array.isArray(note.headings) ? note.headings.slice(0, 12) : [],
+    });
+  }
+
+  optimizePayloadForSpeed(payload) {
+    if (!this.settings.fastResponseMode) {
+      return Object.assign({}, payload, {
+        fastMode: false,
+      });
+    }
+
+    const limits = this.getFastContextLimits(
+      payload.action,
+      Boolean(String(payload.selection || "").trim())
+    );
+
+    return Object.assign({}, payload, {
+      fastMode: true,
+      selection: truncateText(payload.selection || "", limits.selectionChars),
+      note: this.compactNoteContext(payload.note, limits.noteChars),
+      references: Array.isArray(payload.references)
+        ? payload.references
+            .slice(0, limits.maxReferences)
+            .map((note) => this.compactNoteContext(note, limits.referenceChars))
+        : [],
+    });
+  }
+
   shouldPrioritizeReferencedNotes(action, references) {
     return (
       Array.isArray(references) &&
@@ -992,7 +1121,14 @@ module.exports = class CodexAgentPlugin extends Plugin {
     };
   }
 
-  async buildPayload(action, instruction, contextMode, attachments = [], references = []) {
+  async buildPayload(
+    action,
+    instruction,
+    contextMode,
+    attachments = [],
+    references = [],
+    includeCurrentNote = true
+  ) {
     const parsedMentions = this.extractReferencedNotesFromInstruction(instruction);
     const effectiveInstruction = parsedMentions.cleanedInstruction;
     const normalizedAttachments = this.normalizeAttachments(attachments);
@@ -1011,7 +1147,7 @@ module.exports = class CodexAgentPlugin extends Plugin {
         throw new Error("总结需要当前笔记、引用笔记，或至少上传一个文件。");
       }
 
-      return {
+      return this.optimizePayloadForSpeed({
         action,
         instruction: effectiveInstruction,
         selection: "",
@@ -1023,7 +1159,32 @@ module.exports = class CodexAgentPlugin extends Plugin {
           name: "obsidian-codex-agent",
           version: PLUGIN_VERSION,
         },
-      };
+      });
+    }
+
+    if (!includeCurrentNote && action !== "rewrite") {
+      const referenceNotes = await this.loadReferencedNotes(normalizedReferences);
+      if (
+        action === "summarize" &&
+        normalizedAttachments.length === 0 &&
+        referenceNotes.length === 0
+      ) {
+        throw new Error("请先引用至少一篇笔记、上传文件，或重新开启当前笔记引用后再执行总结。");
+      }
+
+      return this.optimizePayloadForSpeed({
+        action,
+        instruction: effectiveInstruction,
+        selection: "",
+        note: null,
+        attachments: normalizedAttachments,
+        references: referenceNotes,
+        resolvedContextMode: "none",
+        client: {
+          name: "obsidian-codex-agent",
+          version: PLUGIN_VERSION,
+        },
+      });
     }
 
     let context = null;
@@ -1057,7 +1218,7 @@ module.exports = class CodexAgentPlugin extends Plugin {
         throw new Error("请先打开一篇 Markdown 笔记，或先引用笔记/上传文件后再执行总结。");
       }
 
-      return {
+      return this.optimizePayloadForSpeed({
         action,
         instruction: effectiveInstruction,
         selection: "",
@@ -1069,14 +1230,14 @@ module.exports = class CodexAgentPlugin extends Plugin {
           name: "obsidian-codex-agent",
           version: PLUGIN_VERSION,
         },
-      };
+      });
     }
 
     if ((action === "rewrite" || contextMode === "selection") && !context.selection.trim()) {
       throw new Error("请先选中一些文本。");
     }
 
-    return {
+    return this.optimizePayloadForSpeed({
       action,
       instruction: effectiveInstruction,
       attachments: normalizedAttachments,
@@ -1100,7 +1261,7 @@ module.exports = class CodexAgentPlugin extends Plugin {
         name: "obsidian-codex-agent",
         version: PLUGIN_VERSION,
       },
-    };
+    });
   }
 
   async callBridge(pathname, method, payload) {
@@ -1176,8 +1337,16 @@ module.exports = class CodexAgentPlugin extends Plugin {
     openSidebar,
     attachments = [],
     references = [],
+    includeCurrentNote = true,
   }) {
-    const payload = await this.buildPayload(action, instruction, contextMode, attachments, references);
+    const payload = await this.buildPayload(
+      action,
+      instruction,
+      contextMode,
+      attachments,
+      references,
+      includeCurrentNote
+    );
     const shouldUseSidebar = openSidebar ?? this.settings.openSidebarOnRun;
     let taskHandle = null;
 

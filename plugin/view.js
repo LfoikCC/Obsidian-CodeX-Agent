@@ -132,6 +132,7 @@ class CodexAgentView extends ItemView {
       instruction: "",
       references: [],
       attachments: [],
+      includeCurrentNote: true,
       mention: null,
       busy: false,
       messages: [],
@@ -180,6 +181,7 @@ class CodexAgentView extends ItemView {
     this.state.resultActionsExpandedId = "";
     this.state.references = [];
     this.state.attachments = [];
+    this.state.includeCurrentNote = true;
     this.state.instruction = "";
     this.state.mention = null;
     this._mentionRenderKey = "";
@@ -277,6 +279,7 @@ class CodexAgentView extends ItemView {
         contextMode: this.state.contextMode,
         attachments: this.state.attachments,
         references: this.state.references,
+        includeCurrentNote: this.state.includeCurrentNote,
         openSidebar: true,
       });
       this.applyInstructionChange("", { cursor: 0 });
@@ -316,10 +319,16 @@ class CodexAgentView extends ItemView {
         this.state.attachments.map((attachment) => [attachment.path.toLowerCase(), attachment])
       );
       let addedCount = 0;
+      let skippedCount = 0;
+      const skippedNames = [];
 
       for (const file of files) {
         const record = this.plugin.createAttachmentRecord(file);
         if (!record) {
+          skippedCount += 1;
+          if (file?.name) {
+            skippedNames.push(String(file.name));
+          }
           continue;
         }
         existing.set(record.path.toLowerCase(), record);
@@ -327,13 +336,18 @@ class CodexAgentView extends ItemView {
       }
 
       if (!addedCount) {
-        new Notice("没有读取到可用附件。请确认你选择的是本地文件。");
+        const sampleNames = skippedNames.slice(0, 3).join("、");
+        const detail = sampleNames
+          ? ` 未能解析这些文件的本地路径：${sampleNames}${skippedNames.length > 3 ? " 等" : ""}。`
+          : "";
+        new Notice(`没有读取到可用附件。请确认你选择的是本地文件。${detail}`);
         return;
       }
 
       this.state.attachments = Array.from(existing.values());
       this.render();
-      new Notice(`已添加 ${addedCount} 个附件。`);
+      const partialHint = skippedCount ? `，另有 ${skippedCount} 个未能读取` : "";
+      new Notice(`已添加 ${addedCount} 个附件${partialHint}。`);
     });
 
     this.fileInputEl = input;
@@ -397,11 +411,20 @@ class CodexAgentView extends ItemView {
   }
 
   removeReferencedNote(referenceId) {
+    if (referenceId === "__current_note__") {
+      this.state.includeCurrentNote = false;
+      this.render();
+      return;
+    }
     this.state.references = this.state.references.filter((reference) => reference.id !== referenceId);
     this.render();
   }
 
   getPinnedCurrentReference() {
+    if (!this.state.includeCurrentNote) {
+      return null;
+    }
+
     const view = this.plugin.getMarkdownView();
     if (!view?.file) {
       return null;
@@ -424,6 +447,13 @@ class CodexAgentView extends ItemView {
     });
 
     return pinned ? [pinned, ...extraReferences] : extraReferences;
+  }
+
+  async toggleFastResponseMode() {
+    this.plugin.settings.fastResponseMode = !this.plugin.settings.fastResponseMode;
+    await this.plugin.saveSettings();
+    this.render();
+    new Notice(this.plugin.settings.fastResponseMode ? "极速模式已开启。" : "极速模式已关闭。");
   }
 
   selectMentionSuggestion(index) {
@@ -542,12 +572,19 @@ class CodexAgentView extends ItemView {
 
       if (reference.pinned) {
         chip.addClass("is-pinned");
-      } else if (options.removable) {
+      }
+
+      const canRemove = options.removable && (!reference.pinned || reference.id === "__current_note__");
+      if (canRemove) {
         const removeButton = chip.createEl("button", {
           cls: "codex-agent-attachment-remove",
         });
         setIcon(removeButton, "x");
-        removeButton.ariaLabel = `移除引用笔记 ${reference.title || ""}`.trim();
+        const labelText =
+          reference.id === "__current_note__"
+            ? "移除当前笔记引用"
+            : `移除引用笔记 ${reference.title || ""}`.trim();
+        removeButton.ariaLabel = labelText;
         removeButton.addEventListener("click", () => this.removeReferencedNote(reference.id));
       }
     }
@@ -775,6 +812,22 @@ class CodexAgentView extends ItemView {
       button.addEventListener("click", onClick);
     });
 
+    const fastButton = heroActions.createEl("button", {
+      cls: [
+        "codex-agent-icon-button",
+        this.plugin.settings.fastResponseMode ? "is-active" : "",
+      ].join(" "),
+    });
+    setIcon(fastButton, "zap");
+    fastButton.ariaLabel = this.plugin.settings.fastResponseMode ? "关闭极速模式" : "开启极速模式";
+    fastButton.addEventListener("click", async () => {
+      try {
+        await this.toggleFastResponseMode();
+      } catch (error) {
+        new Notice(error?.message || String(error));
+      }
+    });
+
     this.renderContextStrip(shell);
 
     const transcript = shell.createDiv({ cls: "codex-agent-transcript" });
@@ -890,6 +943,18 @@ class CodexAgentView extends ItemView {
     if (visibleReferences.length > 0) {
       this.renderReferenceChips(composer, visibleReferences, { removable: true });
     }
+    if (!this.state.includeCurrentNote && this.plugin.getMarkdownView()?.file) {
+      const restoreRow = composer.createDiv({ cls: "codex-agent-attachment-list" });
+      const restoreButton = restoreRow.createEl("button", {
+        text: "引用当前笔记",
+        cls: "codex-agent-chip",
+      });
+      restoreButton.disabled = this.state.busy;
+      restoreButton.addEventListener("click", () => {
+        this.state.includeCurrentNote = true;
+        this.render();
+      });
+    }
 
     if (this.state.attachments.length > 0) {
       this.renderAttachmentChips(composer, this.state.attachments, { removable: true });
@@ -904,6 +969,7 @@ class CodexAgentView extends ItemView {
       clearReferencesButton.disabled = this.state.busy;
       clearReferencesButton.addEventListener("click", () => {
         this.state.references = [];
+        this.state.includeCurrentNote = false;
         this.render();
       });
     }
