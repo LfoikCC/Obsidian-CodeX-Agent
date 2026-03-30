@@ -2,13 +2,13 @@ const fs = require("fs");
 const path = require("path");
 
 const VIEW_TYPE_CODEX_AGENT = "codex-agent-sidebar";
-const PLUGIN_VERSION = "0.2.0";
+const PLUGIN_VERSION = "1.0.0";
 
 const ACTIONS = {
   chat: {
     label: "提问",
     hint: "就当前笔记、整个库或当前选中文本向 Codex 提问。",
-    placeholder: "输入你想让 Codex 回答的问题...",
+    placeholder: "输入你想让 Codex 回答的问题，可用 @ 引用笔记...",
   },
   rewrite: {
     label: "改写",
@@ -17,13 +17,13 @@ const ACTIONS = {
   },
   summarize: {
     label: "总结",
-    hint: "将当前笔记整理成一篇精简摘要。",
-    placeholder: "可选：补充摘要要求...",
+    hint: "将当前笔记或多个文件整理成一篇精简摘要。",
+    placeholder: "可选：补充摘要或多文件汇总要求，也可用 @ 引用笔记...",
   },
   create_note: {
     label: "新建笔记",
     hint: "结合当前笔记上下文生成一篇新笔记。",
-    placeholder: "描述你想让 Codex 创建的笔记...",
+    placeholder: "描述你想让 Codex 创建的笔记，可用 @ 引用笔记...",
   },
 };
 
@@ -72,7 +72,8 @@ const DEFAULT_SETTINGS = {
   bridgeToken: "",
   createNoteFolder: "Codex",
   openSidebarOnRun: true,
-  defaultSummaryInstruction: "请将这篇笔记整理成便于快速回顾的摘要。",
+  defaultSummaryInstruction:
+    "请将当前笔记或所附文件整理成便于快速回顾的摘要；如果有多个文件，请先提炼每个文件的重点，再给出综合结论。",
 };
 
 function trimTrailingSlash(value) {
@@ -264,6 +265,18 @@ function formatNoteContext(note) {
   return parts.join("\n\n");
 }
 
+function formatReferencedNotes(notes) {
+  if (!Array.isArray(notes) || notes.length === 0) {
+    return "未提供额外引用笔记。";
+  }
+
+  return notes
+    .map((note, index) => {
+      return [`## 引用笔记 ${index + 1}`, formatNoteContext(note)].join("\n");
+    })
+    .join("\n\n");
+}
+
 function formatSelection(selection) {
   return String(selection || "").trim() || "(未提供选中内容)";
 }
@@ -317,6 +330,7 @@ function formatAttachments(attachments) {
 
 function buildPrompt(action, instruction, payload, vaultPath) {
   const noteBlock = formatNoteContext(payload.note);
+  const referencesBlock = formatReferencedNotes(payload.references || []);
   const selectionBlock = formatSelection(payload.selection);
   const attachmentsBlock = formatAttachments(payload.attachments || []);
   const vaultBlock = `库根目录: ${vaultPath || "(未知)"}`;
@@ -326,6 +340,7 @@ function buildPrompt(action, instruction, payload, vaultPath) {
       "你是运行在 Obsidian 中的 Codex。",
       "你当前由桌面版 Obsidian 插件调用。仓库根目录就是你的工作目录。",
       "在相关时使用提供的笔记上下文；如果有助于回答问题，也可以查看库中的其他文件。",
+      "如果提供了额外引用笔记，请优先围绕这些引用笔记回答；除非用户明确要求，否则不要把当前活动笔记当成主要依据。",
       "如果提供了附件，请结合附件内容一起分析并回答。",
       "图片附件会作为视觉输入直接附带；其他附件可以通过列出的本地路径读取。",
       "默认使用中文回答，除非用户明确要求其他语言。",
@@ -339,6 +354,8 @@ function buildPrompt(action, instruction, payload, vaultPath) {
       "",
       `附件:\n${attachmentsBlock}`,
       "",
+      `额外引用笔记:\n${referencesBlock}`,
+      "",
       `当前笔记:\n${noteBlock}`,
       "",
     ].join("\n");
@@ -348,6 +365,7 @@ function buildPrompt(action, instruction, payload, vaultPath) {
     return [
       "你是运行在 Obsidian 中的 Codex。",
       "请根据用户要求改写选中的文本。",
+      "如果提供了额外引用笔记，请在必要时参考这些笔记。",
       "如果提供了附件，请在必要时参考附件内容。",
       "图片附件会作为视觉输入直接附带；其他附件可以通过列出的本地路径读取。",
       "默认使用中文输出，除非用户明确要求其他语言。",
@@ -362,16 +380,33 @@ function buildPrompt(action, instruction, payload, vaultPath) {
       "",
       `附件:\n${attachmentsBlock}`,
       "",
+      `额外引用笔记:\n${referencesBlock}`,
+      "",
       `所在笔记上下文:\n${noteBlock}`,
       "",
     ].join("\n");
   }
 
   if (action === "summarize") {
+    const attachmentCount = Array.isArray(payload.attachments) ? payload.attachments.length : 0;
+    let summaryTask = "请基于提供的笔记生成一篇精炼、可独立阅读的 Markdown 摘要笔记。";
+
+    if (!payload.note && attachmentCount === 1) {
+      summaryTask = "请基于提供的文件生成一篇精炼、可独立阅读的 Markdown 摘要笔记。";
+    } else if (!payload.note && attachmentCount > 1) {
+      summaryTask =
+        "请基于提供的多个文件生成一篇汇总摘要，先提炼每个文件的重点，再整理综合结论、共通点与差异点。";
+    } else if (payload.note && attachmentCount > 0) {
+      summaryTask =
+        "请基于当前笔记和提供的文件生成一篇汇总摘要，优先保留核心信息，并在必要时吸收附件中的补充内容。";
+    }
+
     return [
       "你是运行在 Obsidian 中的 Codex。",
-      "请基于提供的笔记生成一篇精炼、可独立阅读的 Markdown 摘要笔记。",
+      summaryTask,
+      "如果提供了额外引用笔记，请优先围绕这些引用笔记组织摘要。",
       "如果提供了附件，请在确有帮助时结合附件内容补充摘要。",
+      "如果提供了多个文件，请先分别提炼重点，再输出整合后的总览。",
       "图片附件会作为视觉输入直接附带；其他附件可以通过列出的本地路径读取。",
       "默认使用中文输出，除非用户明确要求其他语言。",
       "使用一级标题，并让摘要适合后续复习回顾。",
@@ -382,6 +417,8 @@ function buildPrompt(action, instruction, payload, vaultPath) {
       "",
       `附件:\n${attachmentsBlock}`,
       "",
+      `额外引用笔记:\n${referencesBlock}`,
+      "",
       `当前笔记:\n${noteBlock}`,
       "",
     ].join("\n");
@@ -391,6 +428,7 @@ function buildPrompt(action, instruction, payload, vaultPath) {
     return [
       "你是运行在 Obsidian 中的 Codex。",
       "请根据用户请求和提供的上下文起草一篇新的 Markdown 笔记。",
+      "如果提供了额外引用笔记，请优先整合这些引用笔记中的内容。",
       "如果提供了附件，请把附件中的关键信息整合进结果。",
       "图片附件会作为视觉输入直接附带；其他附件可以通过列出的本地路径读取。",
       "默认使用中文输出，除非用户明确要求其他语言。",
@@ -403,6 +441,8 @@ function buildPrompt(action, instruction, payload, vaultPath) {
       `选中内容:\n${selectionBlock}`,
       "",
       `附件:\n${attachmentsBlock}`,
+      "",
+      `额外引用笔记:\n${referencesBlock}`,
       "",
       `参考笔记上下文:\n${noteBlock}`,
       "",

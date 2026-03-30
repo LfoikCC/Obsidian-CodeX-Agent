@@ -6,13 +6,13 @@ const fs = require("fs");
 const path = require("path");
 
 const VIEW_TYPE_CODEX_AGENT = "codex-agent-sidebar";
-const PLUGIN_VERSION = "0.2.0";
+const PLUGIN_VERSION = "1.0.0";
 
 const ACTIONS = {
   chat: {
     label: "提问",
     hint: "就当前笔记、整个库或当前选中文本向 Codex 提问。",
-    placeholder: "输入你想让 Codex 回答的问题...",
+    placeholder: "输入你想让 Codex 回答的问题，可用 @ 引用笔记...",
   },
   rewrite: {
     label: "改写",
@@ -21,13 +21,13 @@ const ACTIONS = {
   },
   summarize: {
     label: "总结",
-    hint: "将当前笔记整理成一篇精简摘要。",
-    placeholder: "可选：补充摘要要求...",
+    hint: "将当前笔记或多个文件整理成一篇精简摘要。",
+    placeholder: "可选：补充摘要或多文件汇总要求，也可用 @ 引用笔记...",
   },
   create_note: {
     label: "新建笔记",
     hint: "结合当前笔记上下文生成一篇新笔记。",
-    placeholder: "描述你想让 Codex 创建的笔记...",
+    placeholder: "描述你想让 Codex 创建的笔记，可用 @ 引用笔记...",
   },
 };
 
@@ -76,7 +76,8 @@ const DEFAULT_SETTINGS = {
   bridgeToken: "",
   createNoteFolder: "Codex",
   openSidebarOnRun: true,
-  defaultSummaryInstruction: "请将这篇笔记整理成便于快速回顾的摘要。",
+  defaultSummaryInstruction:
+    "请将当前笔记或所附文件整理成便于快速回顾的摘要；如果有多个文件，请先提炼每个文件的重点，再给出综合结论。",
 };
 
 function trimTrailingSlash(value) {
@@ -268,6 +269,18 @@ function formatNoteContext(note) {
   return parts.join("\n\n");
 }
 
+function formatReferencedNotes(notes) {
+  if (!Array.isArray(notes) || notes.length === 0) {
+    return "未提供额外引用笔记。";
+  }
+
+  return notes
+    .map((note, index) => {
+      return [`## 引用笔记 ${index + 1}`, formatNoteContext(note)].join("\n");
+    })
+    .join("\n\n");
+}
+
 function formatSelection(selection) {
   return String(selection || "").trim() || "(未提供选中内容)";
 }
@@ -321,6 +334,7 @@ function formatAttachments(attachments) {
 
 function buildPrompt(action, instruction, payload, vaultPath) {
   const noteBlock = formatNoteContext(payload.note);
+  const referencesBlock = formatReferencedNotes(payload.references || []);
   const selectionBlock = formatSelection(payload.selection);
   const attachmentsBlock = formatAttachments(payload.attachments || []);
   const vaultBlock = `库根目录: ${vaultPath || "(未知)"}`;
@@ -330,6 +344,7 @@ function buildPrompt(action, instruction, payload, vaultPath) {
       "你是运行在 Obsidian 中的 Codex。",
       "你当前由桌面版 Obsidian 插件调用。仓库根目录就是你的工作目录。",
       "在相关时使用提供的笔记上下文；如果有助于回答问题，也可以查看库中的其他文件。",
+      "如果提供了额外引用笔记，请优先围绕这些引用笔记回答；除非用户明确要求，否则不要把当前活动笔记当成主要依据。",
       "如果提供了附件，请结合附件内容一起分析并回答。",
       "图片附件会作为视觉输入直接附带；其他附件可以通过列出的本地路径读取。",
       "默认使用中文回答，除非用户明确要求其他语言。",
@@ -343,6 +358,8 @@ function buildPrompt(action, instruction, payload, vaultPath) {
       "",
       `附件:\n${attachmentsBlock}`,
       "",
+      `额外引用笔记:\n${referencesBlock}`,
+      "",
       `当前笔记:\n${noteBlock}`,
       "",
     ].join("\n");
@@ -352,6 +369,7 @@ function buildPrompt(action, instruction, payload, vaultPath) {
     return [
       "你是运行在 Obsidian 中的 Codex。",
       "请根据用户要求改写选中的文本。",
+      "如果提供了额外引用笔记，请在必要时参考这些笔记。",
       "如果提供了附件，请在必要时参考附件内容。",
       "图片附件会作为视觉输入直接附带；其他附件可以通过列出的本地路径读取。",
       "默认使用中文输出，除非用户明确要求其他语言。",
@@ -366,16 +384,33 @@ function buildPrompt(action, instruction, payload, vaultPath) {
       "",
       `附件:\n${attachmentsBlock}`,
       "",
+      `额外引用笔记:\n${referencesBlock}`,
+      "",
       `所在笔记上下文:\n${noteBlock}`,
       "",
     ].join("\n");
   }
 
   if (action === "summarize") {
+    const attachmentCount = Array.isArray(payload.attachments) ? payload.attachments.length : 0;
+    let summaryTask = "请基于提供的笔记生成一篇精炼、可独立阅读的 Markdown 摘要笔记。";
+
+    if (!payload.note && attachmentCount === 1) {
+      summaryTask = "请基于提供的文件生成一篇精炼、可独立阅读的 Markdown 摘要笔记。";
+    } else if (!payload.note && attachmentCount > 1) {
+      summaryTask =
+        "请基于提供的多个文件生成一篇汇总摘要，先提炼每个文件的重点，再整理综合结论、共通点与差异点。";
+    } else if (payload.note && attachmentCount > 0) {
+      summaryTask =
+        "请基于当前笔记和提供的文件生成一篇汇总摘要，优先保留核心信息，并在必要时吸收附件中的补充内容。";
+    }
+
     return [
       "你是运行在 Obsidian 中的 Codex。",
-      "请基于提供的笔记生成一篇精炼、可独立阅读的 Markdown 摘要笔记。",
+      summaryTask,
+      "如果提供了额外引用笔记，请优先围绕这些引用笔记组织摘要。",
       "如果提供了附件，请在确有帮助时结合附件内容补充摘要。",
+      "如果提供了多个文件，请先分别提炼重点，再输出整合后的总览。",
       "图片附件会作为视觉输入直接附带；其他附件可以通过列出的本地路径读取。",
       "默认使用中文输出，除非用户明确要求其他语言。",
       "使用一级标题，并让摘要适合后续复习回顾。",
@@ -386,6 +421,8 @@ function buildPrompt(action, instruction, payload, vaultPath) {
       "",
       `附件:\n${attachmentsBlock}`,
       "",
+      `额外引用笔记:\n${referencesBlock}`,
+      "",
       `当前笔记:\n${noteBlock}`,
       "",
     ].join("\n");
@@ -395,6 +432,7 @@ function buildPrompt(action, instruction, payload, vaultPath) {
     return [
       "你是运行在 Obsidian 中的 Codex。",
       "请根据用户请求和提供的上下文起草一篇新的 Markdown 笔记。",
+      "如果提供了额外引用笔记，请优先整合这些引用笔记中的内容。",
       "如果提供了附件，请把附件中的关键信息整合进结果。",
       "图片附件会作为视觉输入直接附带；其他附件可以通过列出的本地路径读取。",
       "默认使用中文输出，除非用户明确要求其他语言。",
@@ -407,6 +445,8 @@ function buildPrompt(action, instruction, payload, vaultPath) {
       `选中内容:\n${selectionBlock}`,
       "",
       `附件:\n${attachmentsBlock}`,
+      "",
+      `额外引用笔记:\n${referencesBlock}`,
       "",
       `参考笔记上下文:\n${noteBlock}`,
       "",
@@ -767,7 +807,6 @@ const {
 } = require("obsidian");
 const {
   ACTIONS,
-  CONTEXT_MODES,
   formatBytes,
   RUNNER_MODES,
   VIEW_TYPE_CODEX_AGENT,
@@ -886,16 +925,18 @@ class CodexAgentView extends ItemView {
     this.renderToken = 0;
     this.transcriptEl = null;
     this.fileInputEl = null;
+    this.pendingInputSelection = null;
     this.state = {
       action: "chat",
       contextMode: "note+selection",
       instruction: "",
+      references: [],
       attachments: [],
+      mention: null,
       busy: false,
       messages: [],
       runnerInfo: "",
       lastError: "",
-      controlsExpanded: false,
       resultActionsExpandedId: "",
     };
   }
@@ -925,6 +966,7 @@ class CodexAgentView extends ItemView {
       this.fileInputEl.remove();
       this.fileInputEl = null;
     }
+    this.pendingInputSelection = null;
   }
 
   setRunnerInfo(text) {
@@ -936,11 +978,15 @@ class CodexAgentView extends ItemView {
     this.state.messages = [];
     this.state.lastError = "";
     this.state.resultActionsExpandedId = "";
+    this.state.references = [];
     this.state.attachments = [];
+    this.state.instruction = "";
+    this.state.mention = null;
+    this._mentionRenderKey = "";
     this.render();
   }
 
-  beginTask({ action, contextMode, instruction, attachments = [] }) {
+  beginTask({ action, contextMode, instruction, attachments = [], references = [] }) {
     const userId = makeMessageId();
     const assistantId = makeMessageId();
 
@@ -958,6 +1004,7 @@ class CodexAgentView extends ItemView {
       text: instruction || ACTIONS[action].hint,
       meta: {
         attachments,
+        references,
       },
       pending: false,
       error: false,
@@ -1029,31 +1076,13 @@ class CodexAgentView extends ItemView {
         instruction,
         contextMode: this.state.contextMode,
         attachments: this.state.attachments,
+        references: this.state.references,
         openSidebar: true,
       });
-      if (action !== "chat") {
-        this.state.instruction = "";
-      }
+      this.applyInstructionChange("", { cursor: 0 });
     } catch (error) {
       new Notice(error?.message || String(error));
     }
-  }
-
-  renderChipGroup(parent, label, options, activeValue, onSelect) {
-    const group = parent.createDiv({ cls: "codex-agent-chip-group" });
-    group.createEl("div", {
-      text: label,
-      cls: "codex-agent-chip-label",
-    });
-    const row = group.createDiv({ cls: "codex-agent-chip-row" });
-    Object.entries(options).forEach(([key, text]) => {
-      const button = row.createEl("button", {
-        text,
-        cls: key === activeValue ? "codex-agent-chip is-active" : "codex-agent-chip",
-      });
-      button.disabled = this.state.busy;
-      button.addEventListener("click", () => onSelect(key));
-    });
   }
 
   renderDisclosureButton(parent, label, expanded, onClick) {
@@ -1122,6 +1151,147 @@ class CodexAgentView extends ItemView {
     this.render();
   }
 
+  getActiveMention(text, cursor) {
+    const beforeCursor = String(text || "").slice(0, Math.max(Number(cursor || 0), 0));
+    const match = beforeCursor.match(/(?:^|\s)@([^\s@\[\]]*)$/);
+    if (!match) {
+      return null;
+    }
+
+    const query = match[1] || "";
+    const start = beforeCursor.length - query.length - 1;
+    return {
+      start,
+      end: beforeCursor.length,
+      query,
+    };
+  }
+
+  updateMentionState(cursor) {
+    const activeMention = this.getActiveMention(this.state.instruction, cursor);
+    if (!activeMention) {
+      this.state.mention = null;
+      return;
+    }
+
+    const results = this.plugin.searchReferenceableNotes(
+      activeMention.query,
+      new Set(this.state.references.map((item) => String(item.path || "").trim().toLowerCase())),
+      8
+    );
+    this.state.mention = {
+      ...activeMention,
+      selectedIndex: 0,
+      results,
+    };
+  }
+
+  applyInstructionChange(nextInstruction, options = {}) {
+    this.state.instruction = nextInstruction;
+    this.updateMentionState(options.cursor ?? nextInstruction.length);
+    this.pendingInputSelection = {
+      start: options.selectionStart ?? options.cursor ?? nextInstruction.length,
+      end: options.selectionEnd ?? options.cursor ?? nextInstruction.length,
+    };
+    this.render();
+  }
+
+  removeReferencedNote(referenceId) {
+    this.state.references = this.state.references.filter((reference) => reference.id !== referenceId);
+    this.render();
+  }
+
+  getPinnedCurrentReference() {
+    const view = this.plugin.getMarkdownView();
+    if (!view?.file) {
+      return null;
+    }
+
+    return {
+      id: "__current_note__",
+      title: view.file.basename,
+      path: view.file.path,
+      pinned: true,
+    };
+  }
+
+  getVisibleReferences() {
+    const pinned = this.getPinnedCurrentReference();
+    const pinnedPath = String(pinned?.path || "").trim().toLowerCase();
+    const extraReferences = this.state.references.filter((reference) => {
+      const referencePath = String(reference?.path || "").trim().toLowerCase();
+      return referencePath && referencePath !== pinnedPath;
+    });
+
+    return pinned ? [pinned, ...extraReferences] : extraReferences;
+  }
+
+  selectMentionSuggestion(index) {
+    if (!this.state.mention?.results?.length) {
+      return;
+    }
+
+    const item = this.state.mention.results[index] || this.state.mention.results[0];
+    if (!item) {
+      return;
+    }
+
+    const before = this.state.instruction.slice(0, this.state.mention.start);
+    const after = this.state.instruction.slice(this.state.mention.end);
+    const nextInstruction = `${before}${after}`.replace(/ {2,}/g, " ");
+    const nextCursor = before.length;
+
+    const exists = this.state.references.some(
+      (reference) => String(reference.path || "").toLowerCase() === String(item.path || "").toLowerCase()
+    );
+    if (!exists) {
+      this.state.references = [
+        ...this.state.references,
+        {
+          id: item.id,
+          title: item.title,
+          path: item.path,
+        },
+      ];
+    }
+
+    this.applyInstructionChange(nextInstruction, {
+      cursor: nextCursor,
+    });
+    new Notice(`已引用笔记：${item.title}`);
+  }
+
+  renderMentionSuggestions(parent) {
+    if (!this.state.mention?.results?.length) {
+      return;
+    }
+
+    const panel = parent.createDiv({ cls: "codex-agent-mention-panel" });
+    const header = panel.createDiv({ cls: "codex-agent-mention-panel-header" });
+    header.createSpan({ text: "引用笔记" });
+    header.createSpan({ text: `${this.state.mention.results.length} 项` });
+
+    this.state.mention.results.forEach((item, index) => {
+      const button = panel.createEl("button", {
+        cls: [
+          "codex-agent-mention-item",
+          index === this.state.mention.selectedIndex ? "is-active" : "",
+        ].filter(Boolean).join(" "),
+      });
+      button.type = "button";
+      button.addEventListener("click", () => this.selectMentionSuggestion(index));
+
+      const icon = button.createDiv({ cls: "codex-agent-mention-item-icon" });
+      icon.setText("@");
+
+      const content = button.createDiv({ cls: "codex-agent-mention-item-content" });
+      const title = content.createDiv({ cls: "codex-agent-note-suggest-title" });
+      title.setText(item.title);
+      const meta = content.createDiv({ cls: "codex-agent-note-suggest-path" });
+      meta.setText(`@${item.linkPath}`);
+    });
+  }
+
   renderAttachmentChips(parent, attachments, options = {}) {
     if (!Array.isArray(attachments) || attachments.length === 0) {
       return;
@@ -1152,6 +1322,37 @@ class CodexAgentView extends ItemView {
     }
   }
 
+  renderReferenceChips(parent, references, options = {}) {
+    if (!Array.isArray(references) || references.length === 0) {
+      return;
+    }
+
+    const list = parent.createDiv({ cls: "codex-agent-attachment-list" });
+    for (const reference of references) {
+      const chip = list.createDiv({
+        cls: "codex-agent-attachment-chip is-note",
+      });
+
+      const icon = chip.createSpan({ cls: "codex-agent-attachment-icon" });
+      setIcon(icon, "file-text");
+
+      const label = chip.createSpan({ cls: "codex-agent-attachment-label" });
+      label.setText(reference.title || "引用笔记");
+      chip.setAttr("title", reference.path || reference.title || "引用笔记");
+
+      if (reference.pinned) {
+        chip.addClass("is-pinned");
+      } else if (options.removable) {
+        const removeButton = chip.createEl("button", {
+          cls: "codex-agent-attachment-remove",
+        });
+        setIcon(removeButton, "x");
+        removeButton.ariaLabel = `移除引用笔记 ${reference.title || ""}`.trim();
+        removeButton.addEventListener("click", () => this.removeReferencedNote(reference.id));
+      }
+    }
+  }
+
   renderContextStrip(parent) {
     const summary = this.plugin.getContextSummary();
     const strip = parent.createDiv({ cls: "codex-agent-context-strip" });
@@ -1163,17 +1364,7 @@ class CodexAgentView extends ItemView {
       badge.setText(label);
     };
 
-    createBadge(RUNNER_MODES[this.plugin.settings.runnerMode] || "运行器", "runner");
-    createBadge(this.plugin.settings.codexModel, "model");
-    if (summary.noteTitle) {
-      createBadge(summary.noteTitle, "note");
-    } else {
-      createBadge("当前无笔记", "muted");
-    }
     createBadge(summary.selectionText, summary.selectionLength > 0 ? "selection" : "muted");
-    if (this.state.attachments.length > 0) {
-      createBadge(`附件 ${this.state.attachments.length}`, "attachment");
-    }
   }
 
   async renderMessages(container, token) {
@@ -1213,13 +1404,15 @@ class CodexAgentView extends ItemView {
         text: ACTIONS[message.action]?.label || message.action,
         cls: "codex-agent-tag",
       });
-      left.createEl("span", {
-        text: CONTEXT_MODES[message.contextMode] || message.contextMode,
-        cls: "codex-agent-tag is-muted",
-      });
       if (message.meta?.attachments?.length) {
         left.createEl("span", {
           text: `附件 ${message.meta.attachments.length}`,
+          cls: "codex-agent-tag",
+        });
+      }
+      if (message.meta?.references?.length) {
+        left.createEl("span", {
+          text: `引用 ${message.meta.references.length}`,
           cls: "codex-agent-tag",
         });
       }
@@ -1251,6 +1444,10 @@ class CodexAgentView extends ItemView {
           text: message.text,
           cls: "codex-agent-plain-text",
         });
+      }
+
+      if (message.meta?.references?.length) {
+        this.renderReferenceChips(card, message.meta.references, { removable: false });
       }
 
       if (message.meta?.attachments?.length) {
@@ -1391,24 +1588,19 @@ class CodexAgentView extends ItemView {
       text: actionConfig.label,
       cls: "codex-agent-composer-title",
     });
-    this.renderDisclosureButton(
-      composerHeader,
-      this.state.controlsExpanded ? "收起功能" : "展开功能",
-      this.state.controlsExpanded,
-      () => {
-        this.state.controlsExpanded = !this.state.controlsExpanded;
-        this.render();
-      }
-    );
 
-    const composerSummary = composer.createDiv({ cls: "codex-agent-composer-summary" });
-    composerSummary.createEl("span", {
-      text: `当前操作：${actionConfig.label}`,
-      cls: "codex-agent-tag",
-    });
-    composerSummary.createEl("span", {
-      text: `上下文：${CONTEXT_MODES[this.state.contextMode] || this.state.contextMode}`,
-      cls: "codex-agent-tag is-muted",
+    const actionRow = composer.createDiv({ cls: "codex-agent-chip-row codex-agent-action-row" });
+    Object.entries(ACTIONS).forEach(([key, value]) => {
+      const button = actionRow.createEl("button", {
+        text: value.label,
+        cls: key === this.state.action ? "codex-agent-chip is-active" : "codex-agent-chip",
+      });
+      button.disabled = this.state.busy;
+      button.addEventListener("click", () => {
+        this.state.action = key;
+        this.state.contextMode = "note+selection";
+        this.render();
+      });
     });
 
     const inputWrap = composer.createDiv({ cls: "codex-agent-input-wrap" });
@@ -1416,18 +1608,88 @@ class CodexAgentView extends ItemView {
       cls: "codex-agent-input",
     });
     input.rows = 5;
-    input.placeholder = actionConfig.placeholder;
+    input.placeholder = `${actionConfig.placeholder}${actionConfig.placeholder ? "\n" : ""}输入 @ 可快速引用笔记`;
     input.value = this.state.instruction;
     input.disabled = this.state.busy;
     input.addEventListener("input", () => {
       this.state.instruction = input.value;
+      const previousPaths = this.state.references.map((item) => item.path).join("|");
+      this.updateMentionState(input.selectionStart ?? input.value.length);
+      const nextPaths = this.state.references.map((item) => item.path).join("|");
+      const mentionKey = this.state.mention
+        ? `${this.state.mention.start}:${this.state.mention.end}:${this.state.mention.query}:${this.state.mention.results
+            .map((item) => item.path)
+            .join("|")}`
+        : "";
+      const previousMentionKey = this._mentionRenderKey || "";
+      this._mentionRenderKey = mentionKey;
+      if (previousPaths !== nextPaths || previousMentionKey !== mentionKey) {
+        this.pendingInputSelection = {
+          start: input.selectionStart ?? input.value.length,
+          end: input.selectionEnd ?? input.value.length,
+        };
+        this.render();
+      }
     });
     input.addEventListener("keydown", (event) => {
+      if (this.state.mention?.results?.length) {
+        if (event.key === "ArrowDown") {
+          event.preventDefault();
+          this.state.mention.selectedIndex =
+            (this.state.mention.selectedIndex + 1) % this.state.mention.results.length;
+          this.pendingInputSelection = {
+            start: input.selectionStart ?? input.value.length,
+            end: input.selectionEnd ?? input.value.length,
+          };
+          this.render();
+          return;
+        }
+
+        if (event.key === "ArrowUp") {
+          event.preventDefault();
+          this.state.mention.selectedIndex =
+            (this.state.mention.selectedIndex - 1 + this.state.mention.results.length) %
+            this.state.mention.results.length;
+          this.pendingInputSelection = {
+            start: input.selectionStart ?? input.value.length,
+            end: input.selectionEnd ?? input.value.length,
+          };
+          this.render();
+          return;
+        }
+
+        if (event.key === "Enter" || event.key === "Tab") {
+          event.preventDefault();
+          this.selectMentionSuggestion(this.state.mention.selectedIndex || 0);
+          return;
+        }
+
+        if (event.key === "Escape") {
+          event.preventDefault();
+          this.state.mention = null;
+          this.pendingInputSelection = {
+            start: input.selectionStart ?? input.value.length,
+            end: input.selectionEnd ?? input.value.length,
+          };
+          this.render();
+          return;
+        }
+      }
+
       if (event.key === "Enter" && !event.shiftKey) {
         event.preventDefault();
         this.runCurrentAction();
       }
     });
+
+    if (this.state.mention?.results?.length) {
+      this.renderMentionSuggestions(inputWrap);
+    }
+
+    const visibleReferences = this.getVisibleReferences();
+    if (visibleReferences.length > 0) {
+      this.renderReferenceChips(composer, visibleReferences, { removable: true });
+    }
 
     if (this.state.attachments.length > 0) {
       this.renderAttachmentChips(composer, this.state.attachments, { removable: true });
@@ -1435,6 +1697,17 @@ class CodexAgentView extends ItemView {
 
     const composerFooter = composer.createDiv({ cls: "codex-agent-composer-footer" });
     const composerActions = composerFooter.createDiv({ cls: "codex-agent-composer-footer-actions" });
+    if (this.state.references.length > 0) {
+      const clearReferencesButton = composerActions.createEl("button", {
+        text: "清空引用",
+      });
+      clearReferencesButton.disabled = this.state.busy;
+      clearReferencesButton.addEventListener("click", () => {
+        this.state.references = [];
+        this.render();
+      });
+    }
+
     const attachmentButton = composerActions.createEl("button", {
       text: this.state.attachments.length > 0 ? "继续添加附件" : "上传附件",
     });
@@ -1459,35 +1732,17 @@ class CodexAgentView extends ItemView {
     runButton.disabled = this.state.busy;
     runButton.addEventListener("click", () => this.runCurrentAction());
 
-    if (this.state.controlsExpanded) {
-      const advanced = composer.createDiv({ cls: "codex-agent-advanced-panel" });
-      advanced.createEl("div", {
-        text: "功能配置",
-        cls: "codex-agent-advanced-title",
-      });
-
-      this.renderChipGroup(
-        advanced,
-        "操作",
-        Object.fromEntries(Object.entries(ACTIONS).map(([key, value]) => [key, value.label])),
-        this.state.action,
-        (nextAction) => {
-          this.state.action = nextAction;
-          this.state.contextMode = this.plugin.defaultContextModeForAction(nextAction);
-          this.render();
+    if (this.pendingInputSelection) {
+      const selection = this.pendingInputSelection;
+      this.pendingInputSelection = null;
+      window.setTimeout(() => {
+        const latestInput = this.contentEl.querySelector(".codex-agent-input");
+        if (!latestInput) {
+          return;
         }
-      );
-
-      this.renderChipGroup(
-        advanced,
-        "上下文",
-        CONTEXT_MODES,
-        this.state.contextMode,
-        (nextMode) => {
-          this.state.contextMode = nextMode;
-          this.render();
-        }
-      );
+        latestInput.focus();
+        latestInput.setSelectionRange(selection.start, selection.end);
+      }, 0);
     }
   }
 }
@@ -1762,6 +2017,152 @@ class SponsorModal extends Modal {
 
   onClose() {
     this.contentEl.empty();
+  }
+}
+
+class ReferenceNotePickerModal extends Modal {
+  constructor(app, plugin, options = {}) {
+    super(app);
+    this.plugin = plugin;
+    this.options = options;
+    this.resolver = null;
+    this.excludePaths = new Set(
+      (options.excludePaths || [])
+        .map((item) => String(item || "").trim().toLowerCase())
+        .filter(Boolean)
+    );
+    this.items = this.plugin.listReferenceableNotes(this.excludePaths);
+    this.query = "";
+    this.listEl = null;
+  }
+
+  ask() {
+    return new Promise((resolve) => {
+      this.resolver = resolve;
+      this.open();
+    });
+  }
+
+  submit(value) {
+    const resolve = this.resolver;
+    this.resolver = null;
+    this.close();
+    if (resolve) {
+      resolve(value);
+    }
+  }
+
+  getFilteredItems() {
+    const query = this.query.trim().toLowerCase();
+    if (!query) {
+      return this.items.slice(0, 80);
+    }
+
+    return this.items
+      .map((item) => {
+        const title = String(item.title || "").toLowerCase();
+        const itemPath = String(item.path || "").toLowerCase();
+        let score = 0;
+        if (title === query) {
+          score += 10;
+        }
+        if (title.includes(query)) {
+          score += 6;
+        }
+        if (itemPath.includes(query)) {
+          score += 3;
+        }
+        return { item, score };
+      })
+      .filter((entry) => entry.score > 0)
+      .sort((left, right) => right.score - left.score || left.item.path.localeCompare(right.item.path, "zh-CN"))
+      .slice(0, 80)
+      .map((entry) => entry.item);
+  }
+
+  renderList() {
+    if (!this.listEl) {
+      return;
+    }
+
+    this.listEl.empty();
+    const items = this.getFilteredItems();
+
+    if (items.length === 0) {
+      this.listEl.createEl("div", {
+        text: this.items.length === 0 ? "当前库里没有可引用的 Markdown 笔记。" : "没有找到匹配的笔记。",
+        cls: "codex-agent-note-suggest-empty",
+      });
+      return;
+    }
+
+    items.forEach((item, index) => {
+      const button = this.listEl.createEl("button", {
+        cls: "codex-agent-note-suggest-item",
+      });
+      button.type = "button";
+      if (index === 0) {
+        button.addClass("is-first");
+      }
+      button.createEl("div", {
+        text: item.title,
+        cls: "codex-agent-note-suggest-title",
+      });
+      button.createEl("div", {
+        text: item.path,
+        cls: "codex-agent-note-suggest-path",
+      });
+      button.addEventListener("click", () => this.submit(item));
+    });
+  }
+
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.addClass("codex-agent-modal");
+    contentEl.createEl("h2", { text: "引用笔记" });
+    contentEl.createEl("p", {
+      text: "搜索并选择要加入上下文的笔记。可重复添加多篇。",
+      cls: "codex-agent-modal-copy",
+    });
+
+    const input = contentEl.createEl("input", {
+      cls: "codex-agent-note-search-input",
+    });
+    input.type = "text";
+    input.placeholder = "搜索要引用的笔记...";
+    input.value = this.query;
+    input.addEventListener("input", () => {
+      this.query = input.value;
+      this.renderList();
+    });
+    input.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") {
+        const firstItem = this.getFilteredItems()[0];
+        if (firstItem) {
+          event.preventDefault();
+          this.submit(firstItem);
+        }
+      }
+    });
+
+    this.listEl = contentEl.createDiv({ cls: "codex-agent-note-suggest-list" });
+    this.renderList();
+
+    const actionsEl = contentEl.createDiv({ cls: "codex-agent-modal-actions" });
+    const cancelButton = actionsEl.createEl("button", { text: "取消" });
+    cancelButton.addEventListener("click", () => this.submit(null));
+
+    window.setTimeout(() => input.focus(), 0);
+  }
+
+  onClose() {
+    this.contentEl.empty();
+    const resolve = this.resolver;
+    this.resolver = null;
+    if (resolve) {
+      resolve(null);
+    }
   }
 }
 
@@ -2090,6 +2491,221 @@ module.exports = class CodexAgentPlugin extends Plugin {
     return normalized;
   }
 
+  listReferenceableNotes(excludePaths = new Set()) {
+    const excluded = excludePaths instanceof Set ? excludePaths : new Set(excludePaths || []);
+
+    return this.app.vault
+      .getMarkdownFiles()
+      .filter((file) => !excluded.has(String(file.path || "").trim().toLowerCase()))
+      .sort((left, right) => left.path.localeCompare(right.path, "zh-CN"))
+      .map((file) => ({
+        id: `ref-${file.path}`,
+        title: file.basename,
+        path: file.path,
+      }));
+  }
+
+  async pickReferencedNote(existingNotes = []) {
+    const modal = new ReferenceNotePickerModal(this.app, this, {
+      excludePaths: (existingNotes || []).map((item) => item?.path),
+    });
+    return modal.ask();
+  }
+
+  createReferenceRecord(fileLike) {
+    const notePath = String(fileLike?.path || "").trim();
+    if (!notePath) {
+      return null;
+    }
+
+    const file = this.app.vault.getAbstractFileByPath(notePath);
+    if (!file || file.extension !== "md") {
+      return null;
+    }
+
+    return {
+      id: String(fileLike?.id || "").trim() || `ref-${file.path}`,
+      title: String(fileLike?.title || file.basename).trim() || file.basename,
+      path: file.path,
+    };
+  }
+
+  toReferenceLinkPath(notePath) {
+    return String(notePath || "").replace(/\.md$/i, "");
+  }
+
+  resolveReferenceFile(linkPath, sourcePath = "") {
+    const normalized = String(linkPath || "").trim();
+    if (!normalized) {
+      return null;
+    }
+
+    const resolved =
+      this.app.metadataCache.getFirstLinkpathDest(normalized, sourcePath) ||
+      this.app.vault.getAbstractFileByPath(normalized) ||
+      this.app.vault.getAbstractFileByPath(`${normalized}.md`);
+
+    if (!resolved || resolved.extension !== "md") {
+      return null;
+    }
+
+    return resolved;
+  }
+
+  extractReferencedNotesFromInstruction(instruction, options = {}) {
+    const text = String(instruction || "");
+    const sourcePath = String(options.sourcePath || this.getMarkdownView()?.file?.path || "").trim();
+    const references = [];
+    const seen = new Set();
+
+    const cleanedInstruction = text.replace(/@\[\[([^\]]+)\]\]/g, (fullMatch, inner) => {
+      const [linkPathRaw, aliasRaw] = String(inner || "").split("|");
+      const resolvedFile = this.resolveReferenceFile(linkPathRaw, sourcePath);
+      if (!resolvedFile) {
+        return fullMatch;
+      }
+
+      const record = this.createReferenceRecord({
+        path: resolvedFile.path,
+        title: aliasRaw ? aliasRaw.trim() : resolvedFile.basename,
+      });
+      if (!record) {
+        return fullMatch;
+      }
+
+      const key = record.path.toLowerCase();
+      if (!seen.has(key)) {
+        seen.add(key);
+        references.push(record);
+      }
+
+      return `《${record.title}》`;
+    });
+
+    return {
+      references,
+      cleanedInstruction,
+    };
+  }
+
+  searchReferenceableNotes(query, excludePaths = new Set(), limit = 8) {
+    const normalizedQuery = String(query || "").trim().toLowerCase();
+    const items = this.listReferenceableNotes(excludePaths).map((item) => ({
+      ...item,
+      linkPath: this.toReferenceLinkPath(item.path),
+    }));
+
+    if (!normalizedQuery) {
+      return items.slice(0, limit);
+    }
+
+    return items
+      .map((item) => {
+        const title = String(item.title || "").toLowerCase();
+        const itemPath = String(item.path || "").toLowerCase();
+        let score = 0;
+        if (title === normalizedQuery) {
+          score += 10;
+        }
+        if (title.startsWith(normalizedQuery)) {
+          score += 7;
+        }
+        if (title.includes(normalizedQuery)) {
+          score += 5;
+        }
+        if (itemPath.includes(normalizedQuery)) {
+          score += 3;
+        }
+        return { item, score };
+      })
+      .filter((entry) => entry.score > 0)
+      .sort((left, right) => right.score - left.score || left.item.path.localeCompare(right.item.path, "zh-CN"))
+      .slice(0, limit)
+      .map((entry) => entry.item);
+  }
+
+  normalizeReferencedNotes(references) {
+    const normalized = [];
+    const seen = new Set();
+
+    for (const reference of references || []) {
+      const record = this.createReferenceRecord(reference);
+      if (!record) {
+        continue;
+      }
+
+      const key = record.path.toLowerCase();
+      if (seen.has(key)) {
+        continue;
+      }
+
+      seen.add(key);
+      normalized.push(record);
+    }
+
+    return normalized;
+  }
+
+  async loadReferencedNotes(references, options = {}) {
+    const loaded = [];
+    const seen = new Set();
+    const skipPath = String(options.skipPath || "").trim().toLowerCase();
+
+    for (const reference of references || []) {
+      const record = this.createReferenceRecord(reference);
+      if (!record) {
+        continue;
+      }
+
+      const key = record.path.toLowerCase();
+      if (seen.has(key) || (skipPath && key === skipPath)) {
+        continue;
+      }
+
+      const file = this.app.vault.getAbstractFileByPath(record.path);
+      if (!file || file.extension !== "md") {
+        continue;
+      }
+
+      const metadata = this.app.metadataCache.getFileCache(file) || {};
+      const content = await this.app.vault.read(file);
+      loaded.push({
+        title: file.basename,
+        path: file.path,
+        content,
+        frontmatter: metadata.frontmatter || null,
+        headings: Array.isArray(metadata.headings)
+          ? metadata.headings.map((item) => ({
+              heading: item.heading,
+              level: item.level,
+            }))
+          : [],
+      });
+      seen.add(key);
+    }
+
+    return loaded;
+  }
+
+  canUseSupplementalContext(action, attachments, references) {
+    if (!["chat", "create_note", "summarize"].includes(action)) {
+      return false;
+    }
+
+    return (
+      (Array.isArray(attachments) && attachments.length > 0) ||
+      (Array.isArray(references) && references.length > 0)
+    );
+  }
+
+  shouldPrioritizeReferencedNotes(action, references) {
+    return (
+      Array.isArray(references) &&
+      references.length > 0 &&
+      ["chat", "create_note", "summarize"].includes(action)
+    );
+  }
+
   getContextSummary() {
     const view = this.getMarkdownView();
     const selection = view?.editor?.getSelection?.() || "";
@@ -2132,16 +2748,32 @@ module.exports = class CodexAgentPlugin extends Plugin {
     };
   }
 
-  async buildPayload(action, instruction, contextMode, attachments = []) {
+  async buildPayload(action, instruction, contextMode, attachments = [], references = []) {
+    const parsedMentions = this.extractReferencedNotesFromInstruction(instruction);
+    const effectiveInstruction = parsedMentions.cleanedInstruction;
     const normalizedAttachments = this.normalizeAttachments(attachments);
+    const normalizedReferences = this.normalizeReferencedNotes([
+      ...(references || []),
+      ...(parsedMentions.references || []),
+    ]);
 
     if (contextMode === "none") {
+      const referenceNotes = await this.loadReferencedNotes(normalizedReferences);
+      if (
+        action === "summarize" &&
+        normalizedAttachments.length === 0 &&
+        referenceNotes.length === 0
+      ) {
+        throw new Error("总结需要当前笔记、引用笔记，或至少上传一个文件。");
+      }
+
       return {
         action,
-        instruction,
+        instruction: effectiveInstruction,
         selection: "",
         note: null,
         attachments: normalizedAttachments,
+        references: referenceNotes,
         resolvedContextMode: "none",
         client: {
           name: "obsidian-codex-agent",
@@ -2151,21 +2783,43 @@ module.exports = class CodexAgentPlugin extends Plugin {
     }
 
     let context = null;
+    const canFallbackToSupplementalOnly = this.canUseSupplementalContext(
+      action,
+      normalizedAttachments,
+      normalizedReferences
+    );
     try {
       context = await this.requireMarkdownContext();
     } catch (error) {
-      if (!(normalizedAttachments.length > 0 && (action === "chat" || action === "create_note"))) {
+      if (!canFallbackToSupplementalOnly) {
+        if (action === "summarize") {
+          throw new Error("请先打开一篇 Markdown 笔记，或先引用笔记/上传文件后再执行总结。");
+        }
         throw error;
       }
     }
 
+    const referenceNotes = await this.loadReferencedNotes(normalizedReferences, {
+      skipPath: context?.file?.path || "",
+    });
+    const prioritizeReferences = this.shouldPrioritizeReferencedNotes(action, referenceNotes);
+
     if (!context) {
+      if (
+        action === "summarize" &&
+        normalizedAttachments.length === 0 &&
+        referenceNotes.length === 0
+      ) {
+        throw new Error("请先打开一篇 Markdown 笔记，或先引用笔记/上传文件后再执行总结。");
+      }
+
       return {
         action,
-        instruction,
+        instruction: effectiveInstruction,
         selection: "",
         note: null,
         attachments: normalizedAttachments,
+        references: referenceNotes,
         resolvedContextMode: "none",
         client: {
           name: "obsidian-codex-agent",
@@ -2174,25 +2828,30 @@ module.exports = class CodexAgentPlugin extends Plugin {
       };
     }
 
-    if (contextMode === "selection" && !context.selection.trim()) {
+    if ((action === "rewrite" || contextMode === "selection") && !context.selection.trim()) {
       throw new Error("请先选中一些文本。");
     }
 
     return {
       action,
-      instruction,
+      instruction: effectiveInstruction,
       attachments: normalizedAttachments,
+      references: referenceNotes,
       selection:
-        contextMode === "selection" || contextMode === "note+selection"
-          ? context.selection
-          : "",
+        prioritizeReferences
+          ? ""
+          : contextMode === "selection" || contextMode === "note+selection"
+            ? context.selection
+            : "",
       note:
-        contextMode === "selection" ||
-        contextMode === "note" ||
-        contextMode === "note+selection"
-          ? context.note
-          : null,
-      resolvedContextMode: contextMode,
+        prioritizeReferences
+          ? null
+          : contextMode === "selection" ||
+              contextMode === "note" ||
+              contextMode === "note+selection"
+            ? context.note
+            : null,
+      resolvedContextMode: prioritizeReferences ? "none" : contextMode,
       client: {
         name: "obsidian-codex-agent",
         version: PLUGIN_VERSION,
@@ -2266,8 +2925,15 @@ module.exports = class CodexAgentPlugin extends Plugin {
     return runCliTask(this, payload);
   }
 
-  async executeTask({ action, instruction, contextMode, openSidebar, attachments = [] }) {
-    const payload = await this.buildPayload(action, instruction, contextMode, attachments);
+  async executeTask({
+    action,
+    instruction,
+    contextMode,
+    openSidebar,
+    attachments = [],
+    references = [],
+  }) {
+    const payload = await this.buildPayload(action, instruction, contextMode, attachments, references);
     const shouldUseSidebar = openSidebar ?? this.settings.openSidebarOnRun;
     let taskHandle = null;
 
@@ -2279,6 +2945,11 @@ module.exports = class CodexAgentPlugin extends Plugin {
           contextMode: payload.resolvedContextMode || contextMode,
           instruction,
           attachments: payload.attachments || [],
+          references: (payload.references || []).map((note, index) => ({
+            id: `ref-${note.path || index}`,
+            title: note.title || "引用笔记",
+            path: note.path || "",
+          })),
         });
       }
     }

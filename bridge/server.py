@@ -186,15 +186,27 @@ def format_note_context(note: dict[str, Any] | None) -> str:
     return "\n\n".join(parts)
 
 
+def format_reference_notes(references: list[dict[str, Any]] | None) -> str:
+    if not references:
+        return "No extra referenced notes were provided."
+
+    blocks = []
+    for index, note in enumerate(references, start=1):
+        blocks.append(f"## Referenced note {index}\n{format_note_context(note)}")
+    return "\n\n".join(blocks)
+
+
 def format_selection(selection: str) -> str:
     return selection.strip() or "(no selection provided)"
 
 
 def build_prompt(action: str, instruction: str, payload: dict[str, Any]) -> str:
     note = payload.get("note") if isinstance(payload.get("note"), dict) else None
+    references = payload.get("references") if isinstance(payload.get("references"), list) else []
     selection = str(payload.get("selection") or "")
 
     note_block = format_note_context(note)
+    references_block = format_reference_notes(references)
     selection_block = format_selection(selection)
 
     if action == "chat":
@@ -208,6 +220,7 @@ def build_prompt(action: str, instruction: str, payload: dict[str, Any]) -> str:
             "- Do not wrap the entire answer in code fences.\n\n"
             f"User request:\n{instruction}\n\n"
             f"Selected text:\n{selection_block}\n\n"
+            f"Referenced notes:\n{references_block}\n\n"
             f"Active note:\n{note_block}\n"
         )
 
@@ -221,6 +234,7 @@ def build_prompt(action: str, instruction: str, payload: dict[str, Any]) -> str:
             "- Keep the original language unless the instruction says otherwise.\n\n"
             f"Rewrite instruction:\n{instruction}\n\n"
             f"Selected text:\n{selection_block}\n\n"
+            f"Referenced notes:\n{references_block}\n\n"
             f"Parent note context:\n{note_block}\n"
         )
 
@@ -235,6 +249,7 @@ def build_prompt(action: str, instruction: str, payload: dict[str, Any]) -> str:
             "- Keep the summary compact and useful for later review.\n"
             "- Include open questions only if they are supported by the note.\n\n"
             f"Summary instruction:\n{user_instruction}\n\n"
+            f"Referenced notes:\n{references_block}\n\n"
             f"Current note:\n{note_block}\n"
         )
 
@@ -249,6 +264,7 @@ def build_prompt(action: str, instruction: str, payload: dict[str, Any]) -> str:
             "- Add sections only when they are justified by the topic.\n\n"
             f"New note request:\n{instruction}\n\n"
             f"Selected text:\n{selection_block}\n\n"
+            f"Referenced notes:\n{references_block}\n\n"
             f"Reference note context:\n{note_block}\n"
         )
 
@@ -257,6 +273,7 @@ def build_prompt(action: str, instruction: str, payload: dict[str, Any]) -> str:
 
 def fake_response(action: str, instruction: str, payload: dict[str, Any]) -> str:
     note = payload.get("note") if isinstance(payload.get("note"), dict) else {}
+    references = payload.get("references") if isinstance(payload.get("references"), list) else []
     title = str(note.get("title") or "Untitled").strip() or "Untitled"
     selection = str(payload.get("selection") or "").strip()
 
@@ -266,6 +283,7 @@ def fake_response(action: str, instruction: str, payload: dict[str, Any]) -> str
             f"- Request: {instruction}\n"
             f"- Active note: {title}\n"
             f"- Selection present: {'yes' if selection else 'no'}\n"
+            f"- Referenced notes: {len(references)}\n"
         )
 
     if action == "rewrite":

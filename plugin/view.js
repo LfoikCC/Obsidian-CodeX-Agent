@@ -7,7 +7,6 @@ const {
 } = require("obsidian");
 const {
   ACTIONS,
-  CONTEXT_MODES,
   formatBytes,
   RUNNER_MODES,
   VIEW_TYPE_CODEX_AGENT,
@@ -126,16 +125,18 @@ class CodexAgentView extends ItemView {
     this.renderToken = 0;
     this.transcriptEl = null;
     this.fileInputEl = null;
+    this.pendingInputSelection = null;
     this.state = {
       action: "chat",
       contextMode: "note+selection",
       instruction: "",
+      references: [],
       attachments: [],
+      mention: null,
       busy: false,
       messages: [],
       runnerInfo: "",
       lastError: "",
-      controlsExpanded: false,
       resultActionsExpandedId: "",
     };
   }
@@ -165,6 +166,7 @@ class CodexAgentView extends ItemView {
       this.fileInputEl.remove();
       this.fileInputEl = null;
     }
+    this.pendingInputSelection = null;
   }
 
   setRunnerInfo(text) {
@@ -176,11 +178,15 @@ class CodexAgentView extends ItemView {
     this.state.messages = [];
     this.state.lastError = "";
     this.state.resultActionsExpandedId = "";
+    this.state.references = [];
     this.state.attachments = [];
+    this.state.instruction = "";
+    this.state.mention = null;
+    this._mentionRenderKey = "";
     this.render();
   }
 
-  beginTask({ action, contextMode, instruction, attachments = [] }) {
+  beginTask({ action, contextMode, instruction, attachments = [], references = [] }) {
     const userId = makeMessageId();
     const assistantId = makeMessageId();
 
@@ -198,6 +204,7 @@ class CodexAgentView extends ItemView {
       text: instruction || ACTIONS[action].hint,
       meta: {
         attachments,
+        references,
       },
       pending: false,
       error: false,
@@ -269,31 +276,13 @@ class CodexAgentView extends ItemView {
         instruction,
         contextMode: this.state.contextMode,
         attachments: this.state.attachments,
+        references: this.state.references,
         openSidebar: true,
       });
-      if (action !== "chat") {
-        this.state.instruction = "";
-      }
+      this.applyInstructionChange("", { cursor: 0 });
     } catch (error) {
       new Notice(error?.message || String(error));
     }
-  }
-
-  renderChipGroup(parent, label, options, activeValue, onSelect) {
-    const group = parent.createDiv({ cls: "codex-agent-chip-group" });
-    group.createEl("div", {
-      text: label,
-      cls: "codex-agent-chip-label",
-    });
-    const row = group.createDiv({ cls: "codex-agent-chip-row" });
-    Object.entries(options).forEach(([key, text]) => {
-      const button = row.createEl("button", {
-        text,
-        cls: key === activeValue ? "codex-agent-chip is-active" : "codex-agent-chip",
-      });
-      button.disabled = this.state.busy;
-      button.addEventListener("click", () => onSelect(key));
-    });
   }
 
   renderDisclosureButton(parent, label, expanded, onClick) {
@@ -362,6 +351,147 @@ class CodexAgentView extends ItemView {
     this.render();
   }
 
+  getActiveMention(text, cursor) {
+    const beforeCursor = String(text || "").slice(0, Math.max(Number(cursor || 0), 0));
+    const match = beforeCursor.match(/(?:^|\s)@([^\s@\[\]]*)$/);
+    if (!match) {
+      return null;
+    }
+
+    const query = match[1] || "";
+    const start = beforeCursor.length - query.length - 1;
+    return {
+      start,
+      end: beforeCursor.length,
+      query,
+    };
+  }
+
+  updateMentionState(cursor) {
+    const activeMention = this.getActiveMention(this.state.instruction, cursor);
+    if (!activeMention) {
+      this.state.mention = null;
+      return;
+    }
+
+    const results = this.plugin.searchReferenceableNotes(
+      activeMention.query,
+      new Set(this.state.references.map((item) => String(item.path || "").trim().toLowerCase())),
+      8
+    );
+    this.state.mention = {
+      ...activeMention,
+      selectedIndex: 0,
+      results,
+    };
+  }
+
+  applyInstructionChange(nextInstruction, options = {}) {
+    this.state.instruction = nextInstruction;
+    this.updateMentionState(options.cursor ?? nextInstruction.length);
+    this.pendingInputSelection = {
+      start: options.selectionStart ?? options.cursor ?? nextInstruction.length,
+      end: options.selectionEnd ?? options.cursor ?? nextInstruction.length,
+    };
+    this.render();
+  }
+
+  removeReferencedNote(referenceId) {
+    this.state.references = this.state.references.filter((reference) => reference.id !== referenceId);
+    this.render();
+  }
+
+  getPinnedCurrentReference() {
+    const view = this.plugin.getMarkdownView();
+    if (!view?.file) {
+      return null;
+    }
+
+    return {
+      id: "__current_note__",
+      title: view.file.basename,
+      path: view.file.path,
+      pinned: true,
+    };
+  }
+
+  getVisibleReferences() {
+    const pinned = this.getPinnedCurrentReference();
+    const pinnedPath = String(pinned?.path || "").trim().toLowerCase();
+    const extraReferences = this.state.references.filter((reference) => {
+      const referencePath = String(reference?.path || "").trim().toLowerCase();
+      return referencePath && referencePath !== pinnedPath;
+    });
+
+    return pinned ? [pinned, ...extraReferences] : extraReferences;
+  }
+
+  selectMentionSuggestion(index) {
+    if (!this.state.mention?.results?.length) {
+      return;
+    }
+
+    const item = this.state.mention.results[index] || this.state.mention.results[0];
+    if (!item) {
+      return;
+    }
+
+    const before = this.state.instruction.slice(0, this.state.mention.start);
+    const after = this.state.instruction.slice(this.state.mention.end);
+    const nextInstruction = `${before}${after}`.replace(/ {2,}/g, " ");
+    const nextCursor = before.length;
+
+    const exists = this.state.references.some(
+      (reference) => String(reference.path || "").toLowerCase() === String(item.path || "").toLowerCase()
+    );
+    if (!exists) {
+      this.state.references = [
+        ...this.state.references,
+        {
+          id: item.id,
+          title: item.title,
+          path: item.path,
+        },
+      ];
+    }
+
+    this.applyInstructionChange(nextInstruction, {
+      cursor: nextCursor,
+    });
+    new Notice(`已引用笔记：${item.title}`);
+  }
+
+  renderMentionSuggestions(parent) {
+    if (!this.state.mention?.results?.length) {
+      return;
+    }
+
+    const panel = parent.createDiv({ cls: "codex-agent-mention-panel" });
+    const header = panel.createDiv({ cls: "codex-agent-mention-panel-header" });
+    header.createSpan({ text: "引用笔记" });
+    header.createSpan({ text: `${this.state.mention.results.length} 项` });
+
+    this.state.mention.results.forEach((item, index) => {
+      const button = panel.createEl("button", {
+        cls: [
+          "codex-agent-mention-item",
+          index === this.state.mention.selectedIndex ? "is-active" : "",
+        ].filter(Boolean).join(" "),
+      });
+      button.type = "button";
+      button.addEventListener("click", () => this.selectMentionSuggestion(index));
+
+      const icon = button.createDiv({ cls: "codex-agent-mention-item-icon" });
+      icon.setText("@");
+
+      const content = button.createDiv({ cls: "codex-agent-mention-item-content" });
+      const title = content.createDiv({ cls: "codex-agent-note-suggest-title" });
+      title.setText(item.title);
+      const meta = content.createDiv({ cls: "codex-agent-note-suggest-path" });
+      meta.setText(`@${item.linkPath}`);
+    });
+  }
+
   renderAttachmentChips(parent, attachments, options = {}) {
     if (!Array.isArray(attachments) || attachments.length === 0) {
       return;
@@ -392,6 +522,37 @@ class CodexAgentView extends ItemView {
     }
   }
 
+  renderReferenceChips(parent, references, options = {}) {
+    if (!Array.isArray(references) || references.length === 0) {
+      return;
+    }
+
+    const list = parent.createDiv({ cls: "codex-agent-attachment-list" });
+    for (const reference of references) {
+      const chip = list.createDiv({
+        cls: "codex-agent-attachment-chip is-note",
+      });
+
+      const icon = chip.createSpan({ cls: "codex-agent-attachment-icon" });
+      setIcon(icon, "file-text");
+
+      const label = chip.createSpan({ cls: "codex-agent-attachment-label" });
+      label.setText(reference.title || "引用笔记");
+      chip.setAttr("title", reference.path || reference.title || "引用笔记");
+
+      if (reference.pinned) {
+        chip.addClass("is-pinned");
+      } else if (options.removable) {
+        const removeButton = chip.createEl("button", {
+          cls: "codex-agent-attachment-remove",
+        });
+        setIcon(removeButton, "x");
+        removeButton.ariaLabel = `移除引用笔记 ${reference.title || ""}`.trim();
+        removeButton.addEventListener("click", () => this.removeReferencedNote(reference.id));
+      }
+    }
+  }
+
   renderContextStrip(parent) {
     const summary = this.plugin.getContextSummary();
     const strip = parent.createDiv({ cls: "codex-agent-context-strip" });
@@ -403,17 +564,7 @@ class CodexAgentView extends ItemView {
       badge.setText(label);
     };
 
-    createBadge(RUNNER_MODES[this.plugin.settings.runnerMode] || "运行器", "runner");
-    createBadge(this.plugin.settings.codexModel, "model");
-    if (summary.noteTitle) {
-      createBadge(summary.noteTitle, "note");
-    } else {
-      createBadge("当前无笔记", "muted");
-    }
     createBadge(summary.selectionText, summary.selectionLength > 0 ? "selection" : "muted");
-    if (this.state.attachments.length > 0) {
-      createBadge(`附件 ${this.state.attachments.length}`, "attachment");
-    }
   }
 
   async renderMessages(container, token) {
@@ -453,13 +604,15 @@ class CodexAgentView extends ItemView {
         text: ACTIONS[message.action]?.label || message.action,
         cls: "codex-agent-tag",
       });
-      left.createEl("span", {
-        text: CONTEXT_MODES[message.contextMode] || message.contextMode,
-        cls: "codex-agent-tag is-muted",
-      });
       if (message.meta?.attachments?.length) {
         left.createEl("span", {
           text: `附件 ${message.meta.attachments.length}`,
+          cls: "codex-agent-tag",
+        });
+      }
+      if (message.meta?.references?.length) {
+        left.createEl("span", {
+          text: `引用 ${message.meta.references.length}`,
           cls: "codex-agent-tag",
         });
       }
@@ -491,6 +644,10 @@ class CodexAgentView extends ItemView {
           text: message.text,
           cls: "codex-agent-plain-text",
         });
+      }
+
+      if (message.meta?.references?.length) {
+        this.renderReferenceChips(card, message.meta.references, { removable: false });
       }
 
       if (message.meta?.attachments?.length) {
@@ -631,24 +788,19 @@ class CodexAgentView extends ItemView {
       text: actionConfig.label,
       cls: "codex-agent-composer-title",
     });
-    this.renderDisclosureButton(
-      composerHeader,
-      this.state.controlsExpanded ? "收起功能" : "展开功能",
-      this.state.controlsExpanded,
-      () => {
-        this.state.controlsExpanded = !this.state.controlsExpanded;
-        this.render();
-      }
-    );
 
-    const composerSummary = composer.createDiv({ cls: "codex-agent-composer-summary" });
-    composerSummary.createEl("span", {
-      text: `当前操作：${actionConfig.label}`,
-      cls: "codex-agent-tag",
-    });
-    composerSummary.createEl("span", {
-      text: `上下文：${CONTEXT_MODES[this.state.contextMode] || this.state.contextMode}`,
-      cls: "codex-agent-tag is-muted",
+    const actionRow = composer.createDiv({ cls: "codex-agent-chip-row codex-agent-action-row" });
+    Object.entries(ACTIONS).forEach(([key, value]) => {
+      const button = actionRow.createEl("button", {
+        text: value.label,
+        cls: key === this.state.action ? "codex-agent-chip is-active" : "codex-agent-chip",
+      });
+      button.disabled = this.state.busy;
+      button.addEventListener("click", () => {
+        this.state.action = key;
+        this.state.contextMode = "note+selection";
+        this.render();
+      });
     });
 
     const inputWrap = composer.createDiv({ cls: "codex-agent-input-wrap" });
@@ -656,18 +808,88 @@ class CodexAgentView extends ItemView {
       cls: "codex-agent-input",
     });
     input.rows = 5;
-    input.placeholder = actionConfig.placeholder;
+    input.placeholder = `${actionConfig.placeholder}${actionConfig.placeholder ? "\n" : ""}输入 @ 可快速引用笔记`;
     input.value = this.state.instruction;
     input.disabled = this.state.busy;
     input.addEventListener("input", () => {
       this.state.instruction = input.value;
+      const previousPaths = this.state.references.map((item) => item.path).join("|");
+      this.updateMentionState(input.selectionStart ?? input.value.length);
+      const nextPaths = this.state.references.map((item) => item.path).join("|");
+      const mentionKey = this.state.mention
+        ? `${this.state.mention.start}:${this.state.mention.end}:${this.state.mention.query}:${this.state.mention.results
+            .map((item) => item.path)
+            .join("|")}`
+        : "";
+      const previousMentionKey = this._mentionRenderKey || "";
+      this._mentionRenderKey = mentionKey;
+      if (previousPaths !== nextPaths || previousMentionKey !== mentionKey) {
+        this.pendingInputSelection = {
+          start: input.selectionStart ?? input.value.length,
+          end: input.selectionEnd ?? input.value.length,
+        };
+        this.render();
+      }
     });
     input.addEventListener("keydown", (event) => {
+      if (this.state.mention?.results?.length) {
+        if (event.key === "ArrowDown") {
+          event.preventDefault();
+          this.state.mention.selectedIndex =
+            (this.state.mention.selectedIndex + 1) % this.state.mention.results.length;
+          this.pendingInputSelection = {
+            start: input.selectionStart ?? input.value.length,
+            end: input.selectionEnd ?? input.value.length,
+          };
+          this.render();
+          return;
+        }
+
+        if (event.key === "ArrowUp") {
+          event.preventDefault();
+          this.state.mention.selectedIndex =
+            (this.state.mention.selectedIndex - 1 + this.state.mention.results.length) %
+            this.state.mention.results.length;
+          this.pendingInputSelection = {
+            start: input.selectionStart ?? input.value.length,
+            end: input.selectionEnd ?? input.value.length,
+          };
+          this.render();
+          return;
+        }
+
+        if (event.key === "Enter" || event.key === "Tab") {
+          event.preventDefault();
+          this.selectMentionSuggestion(this.state.mention.selectedIndex || 0);
+          return;
+        }
+
+        if (event.key === "Escape") {
+          event.preventDefault();
+          this.state.mention = null;
+          this.pendingInputSelection = {
+            start: input.selectionStart ?? input.value.length,
+            end: input.selectionEnd ?? input.value.length,
+          };
+          this.render();
+          return;
+        }
+      }
+
       if (event.key === "Enter" && !event.shiftKey) {
         event.preventDefault();
         this.runCurrentAction();
       }
     });
+
+    if (this.state.mention?.results?.length) {
+      this.renderMentionSuggestions(inputWrap);
+    }
+
+    const visibleReferences = this.getVisibleReferences();
+    if (visibleReferences.length > 0) {
+      this.renderReferenceChips(composer, visibleReferences, { removable: true });
+    }
 
     if (this.state.attachments.length > 0) {
       this.renderAttachmentChips(composer, this.state.attachments, { removable: true });
@@ -675,6 +897,17 @@ class CodexAgentView extends ItemView {
 
     const composerFooter = composer.createDiv({ cls: "codex-agent-composer-footer" });
     const composerActions = composerFooter.createDiv({ cls: "codex-agent-composer-footer-actions" });
+    if (this.state.references.length > 0) {
+      const clearReferencesButton = composerActions.createEl("button", {
+        text: "清空引用",
+      });
+      clearReferencesButton.disabled = this.state.busy;
+      clearReferencesButton.addEventListener("click", () => {
+        this.state.references = [];
+        this.render();
+      });
+    }
+
     const attachmentButton = composerActions.createEl("button", {
       text: this.state.attachments.length > 0 ? "继续添加附件" : "上传附件",
     });
@@ -699,35 +932,17 @@ class CodexAgentView extends ItemView {
     runButton.disabled = this.state.busy;
     runButton.addEventListener("click", () => this.runCurrentAction());
 
-    if (this.state.controlsExpanded) {
-      const advanced = composer.createDiv({ cls: "codex-agent-advanced-panel" });
-      advanced.createEl("div", {
-        text: "功能配置",
-        cls: "codex-agent-advanced-title",
-      });
-
-      this.renderChipGroup(
-        advanced,
-        "操作",
-        Object.fromEntries(Object.entries(ACTIONS).map(([key, value]) => [key, value.label])),
-        this.state.action,
-        (nextAction) => {
-          this.state.action = nextAction;
-          this.state.contextMode = this.plugin.defaultContextModeForAction(nextAction);
-          this.render();
+    if (this.pendingInputSelection) {
+      const selection = this.pendingInputSelection;
+      this.pendingInputSelection = null;
+      window.setTimeout(() => {
+        const latestInput = this.contentEl.querySelector(".codex-agent-input");
+        if (!latestInput) {
+          return;
         }
-      );
-
-      this.renderChipGroup(
-        advanced,
-        "上下文",
-        CONTEXT_MODES,
-        this.state.contextMode,
-        (nextMode) => {
-          this.state.contextMode = nextMode;
-          this.render();
-        }
-      );
+        latestInput.focus();
+        latestInput.setSelectionRange(selection.start, selection.end);
+      }, 0);
     }
   }
 }

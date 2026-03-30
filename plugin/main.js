@@ -264,6 +264,152 @@ class SponsorModal extends Modal {
   }
 }
 
+class ReferenceNotePickerModal extends Modal {
+  constructor(app, plugin, options = {}) {
+    super(app);
+    this.plugin = plugin;
+    this.options = options;
+    this.resolver = null;
+    this.excludePaths = new Set(
+      (options.excludePaths || [])
+        .map((item) => String(item || "").trim().toLowerCase())
+        .filter(Boolean)
+    );
+    this.items = this.plugin.listReferenceableNotes(this.excludePaths);
+    this.query = "";
+    this.listEl = null;
+  }
+
+  ask() {
+    return new Promise((resolve) => {
+      this.resolver = resolve;
+      this.open();
+    });
+  }
+
+  submit(value) {
+    const resolve = this.resolver;
+    this.resolver = null;
+    this.close();
+    if (resolve) {
+      resolve(value);
+    }
+  }
+
+  getFilteredItems() {
+    const query = this.query.trim().toLowerCase();
+    if (!query) {
+      return this.items.slice(0, 80);
+    }
+
+    return this.items
+      .map((item) => {
+        const title = String(item.title || "").toLowerCase();
+        const itemPath = String(item.path || "").toLowerCase();
+        let score = 0;
+        if (title === query) {
+          score += 10;
+        }
+        if (title.includes(query)) {
+          score += 6;
+        }
+        if (itemPath.includes(query)) {
+          score += 3;
+        }
+        return { item, score };
+      })
+      .filter((entry) => entry.score > 0)
+      .sort((left, right) => right.score - left.score || left.item.path.localeCompare(right.item.path, "zh-CN"))
+      .slice(0, 80)
+      .map((entry) => entry.item);
+  }
+
+  renderList() {
+    if (!this.listEl) {
+      return;
+    }
+
+    this.listEl.empty();
+    const items = this.getFilteredItems();
+
+    if (items.length === 0) {
+      this.listEl.createEl("div", {
+        text: this.items.length === 0 ? "当前库里没有可引用的 Markdown 笔记。" : "没有找到匹配的笔记。",
+        cls: "codex-agent-note-suggest-empty",
+      });
+      return;
+    }
+
+    items.forEach((item, index) => {
+      const button = this.listEl.createEl("button", {
+        cls: "codex-agent-note-suggest-item",
+      });
+      button.type = "button";
+      if (index === 0) {
+        button.addClass("is-first");
+      }
+      button.createEl("div", {
+        text: item.title,
+        cls: "codex-agent-note-suggest-title",
+      });
+      button.createEl("div", {
+        text: item.path,
+        cls: "codex-agent-note-suggest-path",
+      });
+      button.addEventListener("click", () => this.submit(item));
+    });
+  }
+
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.addClass("codex-agent-modal");
+    contentEl.createEl("h2", { text: "引用笔记" });
+    contentEl.createEl("p", {
+      text: "搜索并选择要加入上下文的笔记。可重复添加多篇。",
+      cls: "codex-agent-modal-copy",
+    });
+
+    const input = contentEl.createEl("input", {
+      cls: "codex-agent-note-search-input",
+    });
+    input.type = "text";
+    input.placeholder = "搜索要引用的笔记...";
+    input.value = this.query;
+    input.addEventListener("input", () => {
+      this.query = input.value;
+      this.renderList();
+    });
+    input.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") {
+        const firstItem = this.getFilteredItems()[0];
+        if (firstItem) {
+          event.preventDefault();
+          this.submit(firstItem);
+        }
+      }
+    });
+
+    this.listEl = contentEl.createDiv({ cls: "codex-agent-note-suggest-list" });
+    this.renderList();
+
+    const actionsEl = contentEl.createDiv({ cls: "codex-agent-modal-actions" });
+    const cancelButton = actionsEl.createEl("button", { text: "取消" });
+    cancelButton.addEventListener("click", () => this.submit(null));
+
+    window.setTimeout(() => input.focus(), 0);
+  }
+
+  onClose() {
+    this.contentEl.empty();
+    const resolve = this.resolver;
+    this.resolver = null;
+    if (resolve) {
+      resolve(null);
+    }
+  }
+}
+
 module.exports = class CodexAgentPlugin extends Plugin {
   async onload() {
     this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
@@ -589,6 +735,221 @@ module.exports = class CodexAgentPlugin extends Plugin {
     return normalized;
   }
 
+  listReferenceableNotes(excludePaths = new Set()) {
+    const excluded = excludePaths instanceof Set ? excludePaths : new Set(excludePaths || []);
+
+    return this.app.vault
+      .getMarkdownFiles()
+      .filter((file) => !excluded.has(String(file.path || "").trim().toLowerCase()))
+      .sort((left, right) => left.path.localeCompare(right.path, "zh-CN"))
+      .map((file) => ({
+        id: `ref-${file.path}`,
+        title: file.basename,
+        path: file.path,
+      }));
+  }
+
+  async pickReferencedNote(existingNotes = []) {
+    const modal = new ReferenceNotePickerModal(this.app, this, {
+      excludePaths: (existingNotes || []).map((item) => item?.path),
+    });
+    return modal.ask();
+  }
+
+  createReferenceRecord(fileLike) {
+    const notePath = String(fileLike?.path || "").trim();
+    if (!notePath) {
+      return null;
+    }
+
+    const file = this.app.vault.getAbstractFileByPath(notePath);
+    if (!file || file.extension !== "md") {
+      return null;
+    }
+
+    return {
+      id: String(fileLike?.id || "").trim() || `ref-${file.path}`,
+      title: String(fileLike?.title || file.basename).trim() || file.basename,
+      path: file.path,
+    };
+  }
+
+  toReferenceLinkPath(notePath) {
+    return String(notePath || "").replace(/\.md$/i, "");
+  }
+
+  resolveReferenceFile(linkPath, sourcePath = "") {
+    const normalized = String(linkPath || "").trim();
+    if (!normalized) {
+      return null;
+    }
+
+    const resolved =
+      this.app.metadataCache.getFirstLinkpathDest(normalized, sourcePath) ||
+      this.app.vault.getAbstractFileByPath(normalized) ||
+      this.app.vault.getAbstractFileByPath(`${normalized}.md`);
+
+    if (!resolved || resolved.extension !== "md") {
+      return null;
+    }
+
+    return resolved;
+  }
+
+  extractReferencedNotesFromInstruction(instruction, options = {}) {
+    const text = String(instruction || "");
+    const sourcePath = String(options.sourcePath || this.getMarkdownView()?.file?.path || "").trim();
+    const references = [];
+    const seen = new Set();
+
+    const cleanedInstruction = text.replace(/@\[\[([^\]]+)\]\]/g, (fullMatch, inner) => {
+      const [linkPathRaw, aliasRaw] = String(inner || "").split("|");
+      const resolvedFile = this.resolveReferenceFile(linkPathRaw, sourcePath);
+      if (!resolvedFile) {
+        return fullMatch;
+      }
+
+      const record = this.createReferenceRecord({
+        path: resolvedFile.path,
+        title: aliasRaw ? aliasRaw.trim() : resolvedFile.basename,
+      });
+      if (!record) {
+        return fullMatch;
+      }
+
+      const key = record.path.toLowerCase();
+      if (!seen.has(key)) {
+        seen.add(key);
+        references.push(record);
+      }
+
+      return `《${record.title}》`;
+    });
+
+    return {
+      references,
+      cleanedInstruction,
+    };
+  }
+
+  searchReferenceableNotes(query, excludePaths = new Set(), limit = 8) {
+    const normalizedQuery = String(query || "").trim().toLowerCase();
+    const items = this.listReferenceableNotes(excludePaths).map((item) => ({
+      ...item,
+      linkPath: this.toReferenceLinkPath(item.path),
+    }));
+
+    if (!normalizedQuery) {
+      return items.slice(0, limit);
+    }
+
+    return items
+      .map((item) => {
+        const title = String(item.title || "").toLowerCase();
+        const itemPath = String(item.path || "").toLowerCase();
+        let score = 0;
+        if (title === normalizedQuery) {
+          score += 10;
+        }
+        if (title.startsWith(normalizedQuery)) {
+          score += 7;
+        }
+        if (title.includes(normalizedQuery)) {
+          score += 5;
+        }
+        if (itemPath.includes(normalizedQuery)) {
+          score += 3;
+        }
+        return { item, score };
+      })
+      .filter((entry) => entry.score > 0)
+      .sort((left, right) => right.score - left.score || left.item.path.localeCompare(right.item.path, "zh-CN"))
+      .slice(0, limit)
+      .map((entry) => entry.item);
+  }
+
+  normalizeReferencedNotes(references) {
+    const normalized = [];
+    const seen = new Set();
+
+    for (const reference of references || []) {
+      const record = this.createReferenceRecord(reference);
+      if (!record) {
+        continue;
+      }
+
+      const key = record.path.toLowerCase();
+      if (seen.has(key)) {
+        continue;
+      }
+
+      seen.add(key);
+      normalized.push(record);
+    }
+
+    return normalized;
+  }
+
+  async loadReferencedNotes(references, options = {}) {
+    const loaded = [];
+    const seen = new Set();
+    const skipPath = String(options.skipPath || "").trim().toLowerCase();
+
+    for (const reference of references || []) {
+      const record = this.createReferenceRecord(reference);
+      if (!record) {
+        continue;
+      }
+
+      const key = record.path.toLowerCase();
+      if (seen.has(key) || (skipPath && key === skipPath)) {
+        continue;
+      }
+
+      const file = this.app.vault.getAbstractFileByPath(record.path);
+      if (!file || file.extension !== "md") {
+        continue;
+      }
+
+      const metadata = this.app.metadataCache.getFileCache(file) || {};
+      const content = await this.app.vault.read(file);
+      loaded.push({
+        title: file.basename,
+        path: file.path,
+        content,
+        frontmatter: metadata.frontmatter || null,
+        headings: Array.isArray(metadata.headings)
+          ? metadata.headings.map((item) => ({
+              heading: item.heading,
+              level: item.level,
+            }))
+          : [],
+      });
+      seen.add(key);
+    }
+
+    return loaded;
+  }
+
+  canUseSupplementalContext(action, attachments, references) {
+    if (!["chat", "create_note", "summarize"].includes(action)) {
+      return false;
+    }
+
+    return (
+      (Array.isArray(attachments) && attachments.length > 0) ||
+      (Array.isArray(references) && references.length > 0)
+    );
+  }
+
+  shouldPrioritizeReferencedNotes(action, references) {
+    return (
+      Array.isArray(references) &&
+      references.length > 0 &&
+      ["chat", "create_note", "summarize"].includes(action)
+    );
+  }
+
   getContextSummary() {
     const view = this.getMarkdownView();
     const selection = view?.editor?.getSelection?.() || "";
@@ -631,16 +992,32 @@ module.exports = class CodexAgentPlugin extends Plugin {
     };
   }
 
-  async buildPayload(action, instruction, contextMode, attachments = []) {
+  async buildPayload(action, instruction, contextMode, attachments = [], references = []) {
+    const parsedMentions = this.extractReferencedNotesFromInstruction(instruction);
+    const effectiveInstruction = parsedMentions.cleanedInstruction;
     const normalizedAttachments = this.normalizeAttachments(attachments);
+    const normalizedReferences = this.normalizeReferencedNotes([
+      ...(references || []),
+      ...(parsedMentions.references || []),
+    ]);
 
     if (contextMode === "none") {
+      const referenceNotes = await this.loadReferencedNotes(normalizedReferences);
+      if (
+        action === "summarize" &&
+        normalizedAttachments.length === 0 &&
+        referenceNotes.length === 0
+      ) {
+        throw new Error("总结需要当前笔记、引用笔记，或至少上传一个文件。");
+      }
+
       return {
         action,
-        instruction,
+        instruction: effectiveInstruction,
         selection: "",
         note: null,
         attachments: normalizedAttachments,
+        references: referenceNotes,
         resolvedContextMode: "none",
         client: {
           name: "obsidian-codex-agent",
@@ -650,21 +1027,43 @@ module.exports = class CodexAgentPlugin extends Plugin {
     }
 
     let context = null;
+    const canFallbackToSupplementalOnly = this.canUseSupplementalContext(
+      action,
+      normalizedAttachments,
+      normalizedReferences
+    );
     try {
       context = await this.requireMarkdownContext();
     } catch (error) {
-      if (!(normalizedAttachments.length > 0 && (action === "chat" || action === "create_note"))) {
+      if (!canFallbackToSupplementalOnly) {
+        if (action === "summarize") {
+          throw new Error("请先打开一篇 Markdown 笔记，或先引用笔记/上传文件后再执行总结。");
+        }
         throw error;
       }
     }
 
+    const referenceNotes = await this.loadReferencedNotes(normalizedReferences, {
+      skipPath: context?.file?.path || "",
+    });
+    const prioritizeReferences = this.shouldPrioritizeReferencedNotes(action, referenceNotes);
+
     if (!context) {
+      if (
+        action === "summarize" &&
+        normalizedAttachments.length === 0 &&
+        referenceNotes.length === 0
+      ) {
+        throw new Error("请先打开一篇 Markdown 笔记，或先引用笔记/上传文件后再执行总结。");
+      }
+
       return {
         action,
-        instruction,
+        instruction: effectiveInstruction,
         selection: "",
         note: null,
         attachments: normalizedAttachments,
+        references: referenceNotes,
         resolvedContextMode: "none",
         client: {
           name: "obsidian-codex-agent",
@@ -673,25 +1072,30 @@ module.exports = class CodexAgentPlugin extends Plugin {
       };
     }
 
-    if (contextMode === "selection" && !context.selection.trim()) {
+    if ((action === "rewrite" || contextMode === "selection") && !context.selection.trim()) {
       throw new Error("请先选中一些文本。");
     }
 
     return {
       action,
-      instruction,
+      instruction: effectiveInstruction,
       attachments: normalizedAttachments,
+      references: referenceNotes,
       selection:
-        contextMode === "selection" || contextMode === "note+selection"
-          ? context.selection
-          : "",
+        prioritizeReferences
+          ? ""
+          : contextMode === "selection" || contextMode === "note+selection"
+            ? context.selection
+            : "",
       note:
-        contextMode === "selection" ||
-        contextMode === "note" ||
-        contextMode === "note+selection"
-          ? context.note
-          : null,
-      resolvedContextMode: contextMode,
+        prioritizeReferences
+          ? null
+          : contextMode === "selection" ||
+              contextMode === "note" ||
+              contextMode === "note+selection"
+            ? context.note
+            : null,
+      resolvedContextMode: prioritizeReferences ? "none" : contextMode,
       client: {
         name: "obsidian-codex-agent",
         version: PLUGIN_VERSION,
@@ -765,8 +1169,15 @@ module.exports = class CodexAgentPlugin extends Plugin {
     return runCliTask(this, payload);
   }
 
-  async executeTask({ action, instruction, contextMode, openSidebar, attachments = [] }) {
-    const payload = await this.buildPayload(action, instruction, contextMode, attachments);
+  async executeTask({
+    action,
+    instruction,
+    contextMode,
+    openSidebar,
+    attachments = [],
+    references = [],
+  }) {
+    const payload = await this.buildPayload(action, instruction, contextMode, attachments, references);
     const shouldUseSidebar = openSidebar ?? this.settings.openSidebarOnRun;
     let taskHandle = null;
 
@@ -778,6 +1189,11 @@ module.exports = class CodexAgentPlugin extends Plugin {
           contextMode: payload.resolvedContextMode || contextMode,
           instruction,
           attachments: payload.attachments || [],
+          references: (payload.references || []).map((note, index) => ({
+            id: `ref-${note.path || index}`,
+            title: note.title || "引用笔记",
+            path: note.path || "",
+          })),
         });
       }
     }
